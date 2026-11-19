@@ -17,14 +17,15 @@
 #include "core/variant/dictionary.h"
 
 class Button;
-class ConfirmationDialog;
 class EditorDock;
 class HTTPRequest;
 class Label;
 class LineEdit;
 class Node;
 class RichTextLabel;
+class ScrollContainer;
 class TextEdit;
+class VBoxContainer;
 class Window;
 
 class HorrorAIAssistantEditorPlugin : public EditorPlugin {
@@ -32,20 +33,18 @@ class HorrorAIAssistantEditorPlugin : public EditorPlugin {
 
 	EditorDock *dock = nullptr;
 	HTTPRequest *http_request = nullptr;
-	RichTextLabel *transcript = nullptr;
+	ScrollContainer *transcript_scroll = nullptr;
+	VBoxContainer *message_list = nullptr;
 	TextEdit *prompt_input = nullptr;
 	Label *status_label = nullptr;
 	Label *session_title = nullptr;
 	Button *send_button = nullptr;
-	Button *apply_button = nullptr;
 	Button *activity_button = nullptr;
 	Window *settings_window = nullptr;
-	TextEdit *change_preview = nullptr;
 	TextEdit *activity_details = nullptr;
 	LineEdit *endpoint_input = nullptr;
 	LineEdit *deployment_input = nullptr;
 	LineEdit *api_key_input = nullptr;
-	ConfirmationDialog *apply_dialog = nullptr;
 
 	Array responses_input_items;
 	Array activity_entries;
@@ -62,6 +61,8 @@ class HorrorAIAssistantEditorPlugin : public EditorPlugin {
 	void _load_settings();
 	void _start_new_session();
 	void _append_message(const String &p_role, const String &p_text);
+	void _copy_message(const String &p_text);
+	void _edit_message(const String &p_text);
 	void _send_prompt();
 	void _request_next_turn();
 	void _on_request_completed(int p_result, int p_response_code, const PackedStringArray &p_headers, const PackedByteArray &p_body);
@@ -70,10 +71,9 @@ class HorrorAIAssistantEditorPlugin : public EditorPlugin {
 	void _record_tool_activity(const String &p_name, const Dictionary &p_arguments, const Dictionary &p_result);
 	void _refresh_activity_view();
 	void _toggle_activity_details();
+	void _discard_staged_changes();
 	void _show_settings();
 	void _save_settings();
-	void _update_pending_changes();
-	void _confirm_apply_changes();
 	void _apply_changes();
 
 	Array _get_tool_schemas() const;

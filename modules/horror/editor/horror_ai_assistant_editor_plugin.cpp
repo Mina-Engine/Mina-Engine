@@ -26,15 +26,19 @@
 #include "editor/themes/editor_scale.h"
 #include "scene/gui/box_container.h"
 #include "scene/gui/button.h"
+#include "scene/gui/control.h"
 #include "scene/gui/dialogs.h"
 #include "scene/gui/label.h"
 #include "scene/gui/line_edit.h"
 #include "scene/gui/margin_container.h"
+#include "scene/gui/panel_container.h"
 #include "scene/gui/rich_text_label.h"
 #include "scene/gui/scroll_container.h"
 #include "scene/gui/separator.h"
 #include "scene/gui/text_edit.h"
 #include "scene/main/http_request.h"
+#include "scene/resources/style_box_flat.h"
+#include "servers/display_server.h"
 
 #ifdef WINDOWS_ENABLED
 #include <windows.h>
@@ -140,16 +144,15 @@ void HorrorAIAssistantEditorPlugin::_build_panel() {
 	layout->add_child(header);
 	layout->add_child(memnew(HSeparator));
 
-	ScrollContainer *scroll = memnew(ScrollContainer);
-	scroll->set_v_size_flags(Control::SIZE_EXPAND_FILL);
-	scroll->set_horizontal_scroll_mode(ScrollContainer::SCROLL_MODE_DISABLED);
-	layout->add_child(scroll);
-	transcript = memnew(RichTextLabel);
-	transcript->set_use_bbcode(false);
-	transcript->set_fit_content(true);
-	transcript->set_h_size_flags(Control::SIZE_EXPAND_FILL);
-	transcript->set_custom_minimum_size(Size2(0, 220) * EDSCALE);
-	scroll->add_child(transcript);
+	transcript_scroll = memnew(ScrollContainer);
+	transcript_scroll->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+	transcript_scroll->set_horizontal_scroll_mode(ScrollContainer::SCROLL_MODE_DISABLED);
+	layout->add_child(transcript_scroll);
+	message_list = memnew(VBoxContainer);
+	message_list->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	message_list->set_custom_minimum_size(Size2(0, 220) * EDSCALE);
+	message_list->add_theme_constant_override("separation", 18 * EDSCALE);
+	transcript_scroll->add_child(message_list);
 
 	activity_button = memnew(Button);
 	activity_button->set_text(String::utf8("作業内容を表示"));
@@ -163,15 +166,10 @@ void HorrorAIAssistantEditorPlugin::_build_panel() {
 	activity_details->set_visible(false);
 	layout->add_child(activity_details);
 
-	apply_button = memnew(Button);
-	apply_button->set_text(String::utf8("AIの変更案を確認"));
-	apply_button->set_visible(false);
-	apply_button->connect(SceneStringName(pressed), callable_mp(this, &HorrorAIAssistantEditorPlugin::_confirm_apply_changes));
-	layout->add_child(apply_button);
-
 	status_label = memnew(Label);
 	status_label->set_text(String::utf8("Azure OpenAI未設定"));
 	status_label->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
+	status_label->set_visible(false);
 	layout->add_child(status_label);
 
 	prompt_input = memnew(TextEdit);
@@ -196,19 +194,6 @@ void HorrorAIAssistantEditorPlugin::_build_panel() {
 	http_request->set_timeout(120.0);
 	dock->add_child(http_request);
 	http_request->connect("request_completed", callable_mp(this, &HorrorAIAssistantEditorPlugin::_on_request_completed));
-
-	apply_dialog = memnew(ConfirmationDialog);
-	apply_dialog->set_title(String::utf8("AIが作成した変更を適用"));
-	apply_dialog->set_ok_button_text(String::utf8("適用"));
-	apply_dialog->set_cancel_button_text(String::utf8("戻る"));
-	dock->add_child(apply_dialog);
-	apply_dialog->get_label()->hide();
-	change_preview = memnew(TextEdit);
-	change_preview->set_editable(false);
-	change_preview->set_line_wrapping_mode(TextEdit::LINE_WRAPPING_BOUNDARY);
-	change_preview->set_custom_minimum_size(Size2(600, 340) * EDSCALE);
-	apply_dialog->add_child(change_preview);
-	apply_dialog->connect("confirmed", callable_mp(this, &HorrorAIAssistantEditorPlugin::_apply_changes));
 
 	_build_settings_window();
 	EditorDockManager::get_singleton()->add_dock(dock);
@@ -304,8 +289,12 @@ void HorrorAIAssistantEditorPlugin::_load_settings() {
 }
 
 void HorrorAIAssistantEditorPlugin::_start_new_session() {
+	if (busy) {
+		return;
+	}
 	if (!staged_files.is_empty()) {
 		status_label->set_text(String::utf8("先に未適用の変更案を確認してください。"));
+		status_label->set_visible(true);
 		return;
 	}
 	responses_input_items.clear();
@@ -322,19 +311,23 @@ void HorrorAIAssistantEditorPlugin::_start_new_session() {
 			"必ず利用可能なツールでプロジェクト構成と対象ファイルを調べてから編集案を作ってください。音声などのバイナリアセットを捏造せず、既存音声一覧から選んでください。必要な場合は .tscn と .gd を一緒に作成し、イベントのタイミングや音の再生、照明変化はスクリプトで実装してください。\n"
 			"ファイル変更は stage_project_file だけで提案してください。既存ファイルを読む前に置き換えないでください。すべてのパスは res:// 以下で、テキスト形式のファイルだけを扱います。変更案はユーザーが一括確認してから適用されます。"
 	);
-	if (transcript) {
-		transcript->clear();
-		transcript->add_text(String::utf8("Mina AI\n何を作りましょう？\n\n"));
+	if (message_list) {
+		for (int i = 0; i < message_list->get_child_count(); i++) {
+			message_list->get_child(i)->queue_free();
+		}
+		_append_message("assistant", String::utf8("何を作りましょう？"));
 	}
 	if (session_title) {
 		session_title->set_text(String::utf8("新しいセッション"));
 	}
 	if (status_label) {
 		status_label->set_text(String::utf8("Azure OpenAI 接続待ち"));
+		status_label->set_visible(false);
 	}
 }
+
 void HorrorAIAssistantEditorPlugin::_append_message(const String &p_role, const String &p_text) {
-	if (!transcript) {
+	if (!message_list) {
 		return;
 	}
 	String display_text = p_text;
@@ -342,9 +335,105 @@ void HorrorAIAssistantEditorPlugin::_append_message(const String &p_role, const 
 	if (p_role == "user" && (p_text.length() > 1000 || line_count > 20)) {
 		display_text = vformat(String::utf8("長文を送信しました（%d行・%d文字）。全文はAIに送信済みです。"), line_count, p_text.length());
 	}
-	transcript->add_text("\n" + (p_role == "user" ? String::utf8("【あなた】") : String::utf8("【Mina AI】")) + "\n");
-	transcript->add_text(display_text + "\n\n");
-	transcript->scroll_to_line(transcript->get_line_count());
+	bool is_user = p_role == "user";
+	VBoxContainer *message = memnew(VBoxContainer);
+	message->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	message->add_theme_constant_override("separation", 3 * EDSCALE);
+	message_list->add_child(message);
+
+	HBoxContainer *message_row = memnew(HBoxContainer);
+	message_row->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	message->add_child(message_row);
+
+	RichTextLabel *body = memnew(RichTextLabel);
+	body->set_use_bbcode(false);
+	body->set_fit_content(true);
+	body->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
+	body->set_selection_enabled(true);
+	body->set_text(display_text);
+	if (is_user) {
+		Control *spacer = memnew(Control);
+		spacer->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+		message_row->add_child(spacer);
+
+		real_t available_width = transcript_scroll ? transcript_scroll->get_size().x : 0;
+		if (available_width <= 0 && dock) {
+			available_width = dock->get_custom_minimum_size().x;
+		}
+		real_t max_bubble_width = MAX(140 * EDSCALE, available_width * 0.78);
+		int longest_line = 0;
+		PackedStringArray lines = display_text.split("\n");
+		for (int i = 0; i < lines.size(); i++) {
+			longest_line = MAX(longest_line, lines[i].length());
+		}
+		real_t bubble_width = MIN(max_bubble_width, MAX(72 * EDSCALE, longest_line * 12 * EDSCALE + 28 * EDSCALE));
+
+		PanelContainer *bubble = memnew(PanelContainer);
+		bubble->set_h_size_flags(Control::SIZE_SHRINK_END);
+		bubble->set_custom_minimum_size(Size2(bubble_width, 0));
+		Ref<StyleBoxFlat> bubble_style;
+		bubble_style.instantiate();
+		Ref<Theme> editor_theme = EditorInterface::get_singleton()->get_editor_theme();
+		if (editor_theme.is_valid()) {
+			bubble_style->set_bg_color(editor_theme->get_color("dark_color_2", "Editor"));
+		}
+		bubble_style->set_corner_radius_all(16 * EDSCALE);
+		bubble_style->set_content_margin_all(12 * EDSCALE);
+		bubble->add_theme_stylebox_override("panel", bubble_style);
+		message_row->add_child(bubble);
+		body->set_custom_minimum_size(Size2(MAX(48 * EDSCALE, bubble_width - 24 * EDSCALE), 0));
+		bubble->add_child(body);
+	} else {
+		body->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+		message_row->add_child(body);
+	}
+
+	HBoxContainer *actions = memnew(HBoxContainer);
+	actions->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	actions->set_alignment(is_user ? BoxContainer::ALIGNMENT_END : BoxContainer::ALIGNMENT_BEGIN);
+	message->add_child(actions);
+	Ref<Theme> editor_theme = EditorInterface::get_singleton()->get_editor_theme();
+	Button *copy_button = memnew(Button);
+	copy_button->set_flat(true);
+	copy_button->set_tooltip_text(String::utf8("メッセージをコピー"));
+	copy_button->set_custom_minimum_size(Size2(24, 24) * EDSCALE);
+	if (editor_theme.is_valid() && editor_theme->has_icon("ActionCopy", "EditorIcons")) {
+		copy_button->set_button_icon(editor_theme->get_icon("ActionCopy", "EditorIcons"));
+	} else {
+		copy_button->set_text(String::utf8("コピー"));
+	}
+	copy_button->connect(SceneStringName(pressed), callable_mp(this, &HorrorAIAssistantEditorPlugin::_copy_message).bind(p_text));
+	actions->add_child(copy_button);
+	if (is_user) {
+		Button *edit_button = memnew(Button);
+		edit_button->set_flat(true);
+		edit_button->set_tooltip_text(String::utf8("入力欄に戻す"));
+		edit_button->set_custom_minimum_size(Size2(24, 24) * EDSCALE);
+		if (editor_theme.is_valid() && editor_theme->has_icon("Edit", "EditorIcons")) {
+			edit_button->set_button_icon(editor_theme->get_icon("Edit", "EditorIcons"));
+		} else {
+			edit_button->set_text(String::utf8("編集"));
+		}
+		edit_button->connect(SceneStringName(pressed), callable_mp(this, &HorrorAIAssistantEditorPlugin::_edit_message).bind(p_text));
+		actions->add_child(edit_button);
+	}
+	if (transcript_scroll) {
+		transcript_scroll->call_deferred("ensure_control_visible", message);
+	}
+}
+
+void HorrorAIAssistantEditorPlugin::_copy_message(const String &p_text) {
+	DisplayServer *display_server = DisplayServer::get_singleton();
+	if (display_server) {
+		display_server->clipboard_set(p_text);
+	}
+}
+
+void HorrorAIAssistantEditorPlugin::_edit_message(const String &p_text) {
+	if (prompt_input) {
+		prompt_input->set_text(p_text);
+		prompt_input->grab_focus();
+	}
 }
 
 String HorrorAIAssistantEditorPlugin::_get_setting(const String &p_name, const String &p_default) const {
@@ -408,8 +497,16 @@ void HorrorAIAssistantEditorPlugin::_send_prompt() {
 	}
 	if (api_key.is_empty() || _get_setting("mina/ai/azure_endpoint", "").is_empty() || _get_setting("mina/ai/azure_deployment", "").is_empty()) {
 		status_label->set_text(String::utf8("Azure OpenAIの接続設定が必要です。"));
+		status_label->set_visible(true);
 		_show_settings();
 		return;
+	}
+	if (responses_input_items.is_empty() && session_title && session_title->get_text() == String::utf8("新しいセッション")) {
+		String title = prompt.replace("\n", " ").strip_edges();
+		if (title.length() > 28) {
+			title = title.substr(0, 27) + "…";
+		}
+		session_title->set_text(title);
 	}
 	Dictionary response_input_message;
 	response_input_message["type"] = "message";
