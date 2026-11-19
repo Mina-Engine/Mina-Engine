@@ -16,6 +16,7 @@
 #include "core/io/file_access.h"
 #include "core/io/http_client.h"
 #include "core/io/json.h"
+#include "core/io/stream_peer_tls.h"
 #include "core/object/callable_mp.h"
 #include "core/os/os.h"
 #include "editor/docks/editor_dock.h"
@@ -208,18 +209,6 @@ void HorrorAIAssistantEditorPlugin::_build_panel() {
 	message_list->add_theme_constant_override("separation", 18 * EDSCALE);
 	transcript_scroll->add_child(message_list);
 
-	activity_button = memnew(Button);
-	activity_button->set_text(String::utf8("作業内容を表示"));
-	activity_button->set_visible(false);
-	activity_button->connect(SceneStringName(pressed), callable_mp(this, &HorrorAIAssistantEditorPlugin::_toggle_activity_details));
-	layout->add_child(activity_button);
-	activity_details = memnew(TextEdit);
-	activity_details->set_editable(false);
-	activity_details->set_line_wrapping_mode(TextEdit::LINE_WRAPPING_BOUNDARY);
-	activity_details->set_custom_minimum_size(Size2(0, 150) * EDSCALE);
-	activity_details->set_visible(false);
-	layout->add_child(activity_details);
-
 	status_label = memnew(Label);
 	status_label->set_text(String::utf8("Azure OpenAI未設定"));
 	status_label->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
@@ -260,11 +249,6 @@ void HorrorAIAssistantEditorPlugin::_build_panel() {
 	input_footer->add_child(send_button);
 	layout->add_child(input_footer);
 
-	http_request = memnew(HTTPRequest);
-	http_request->set_use_threads(true);
-	http_request->set_timeout(120.0);
-	dock->add_child(http_request);
-	http_request->connect("request_completed", callable_mp(this, &HorrorAIAssistantEditorPlugin::_on_request_completed));
 	image_file_dialog = memnew(FileDialog);
 	image_file_dialog->set_title(String::utf8("添付する画像を選択"));
 	image_file_dialog->set_file_mode(FileDialog::FILE_MODE_OPEN_FILES);
@@ -635,13 +619,10 @@ void HorrorAIAssistantEditorPlugin::_start_new_session() {
 	current_session_id.clear();
 	_clear_image_attachments();
 	activity_entries.clear();
-	if (activity_button) {
-		activity_button->set_visible(false);
-	}
-	if (activity_details) {
-		activity_details->clear();
-		activity_details->set_visible(false);
-	}
+	_clear_streaming_reply();
+	activity_card = nullptr;
+	activity_button = nullptr;
+	activity_details = nullptr;
 	system_instructions = String::utf8(
 			"あなたは Mina Engine に組み込まれたゲーム制作エージェントです。Godot 4.7.2 のプロジェクトを調査し、ユーザーの指示に沿ってシーン、GDScript、音響の配置、演出イベントをまとめて制作します。日本語で応答してください。\n"
 			"必ず利用可能なツールでプロジェクト構成と対象ファイルを調べてから編集案を作ってください。音声などのバイナリアセットを捏造せず、既存音声一覧から選んでください。必要な場合は .tscn と .gd を一緒に作成し、イベントのタイミングや音の再生、照明変化はスクリプトで実装してください。\n"
@@ -932,6 +913,7 @@ void HorrorAIAssistantEditorPlugin::_send_prompt() {
 }
 
 void HorrorAIAssistantEditorPlugin::_request_next_turn() {
+	_close_stream_transport();
 	String endpoint = _get_setting("mina/ai/azure_endpoint", "").strip_edges();
 	while (endpoint.ends_with("/")) {
 		endpoint = endpoint.substr(0, endpoint.length() - 1);
@@ -956,15 +938,264 @@ void HorrorAIAssistantEditorPlugin::_request_next_turn() {
 	request_body["input"] = responses_input_items;
 	request_body["tools"] = _get_tool_schemas();
 	request_body["tool_choice"] = "auto";
-	Vector<String> headers;
-	headers.push_back("Content-Type: application/json");
-	headers.push_back("api-key: " + api_key);
-	Error error = http_request->request(url, headers, HTTPClient::METHOD_POST, JSON::stringify(request_body));
-	if (error != OK) {
-		responses_input_items.clear();
+	request_body["stream"] = true;
+	String scheme;
+	String host;
+	String request_path;
+	String fragment;
+	int port = 0;
+	Error error = url.parse_url(scheme, host, port, request_path, fragment);
+	if (error != OK || scheme != "https://") {
 		_discard_staged_changes();
-		_set_busy(false, vformat(String::utf8("Azure OpenAIへのリクエストを開始できませんでした (%s)。"), error));
+		_set_busy(false, String::utf8("Azure OpenAIのEndpoint URLを解析できませんでした。"));
+		return;
 	}
+	if (port == 0) {
+		port = 443;
+	}
+	if (request_path.is_empty()) {
+		request_path = "/";
+	}
+	stream_request_path = request_path;
+	stream_headers.clear();
+	stream_headers.push_back("Content-Type: application/json");
+	stream_headers.push_back("Accept: text/event-stream");
+	stream_headers.push_back("api-key: " + api_key);
+	stream_request_body = JSON::stringify(request_body).to_utf8_buffer();
+	stream_buffer.clear();
+	stream_error_body.clear();
+	stream_raw_body.clear();
+	stream_response_code = 0;
+	stream_request_sent = false;
+	stream_started_msec = OS::get_singleton()->get_ticks_msec();
+	stream_text.clear();
+	stream_client = HTTPClient::create();
+	stream_client->set_read_chunk_size(32768);
+	error = stream_client->connect_to_host(host, port, TLSOptions::client());
+	if (error != OK) {
+		_fail_stream(vformat(String::utf8("Azure OpenAIへの接続を開始できませんでした (%s)。"), error));
+		return;
+	}
+	_begin_streaming_reply();
+	set_process(true);
+}
+
+void HorrorAIAssistantEditorPlugin::_poll_stream() {
+	if (stream_client.is_null()) {
+		return;
+	}
+	if (OS::get_singleton()->get_ticks_msec() - stream_started_msec > 120000) {
+		_fail_stream(String::utf8("Azure OpenAIの応答がタイムアウトしました。"));
+		return;
+	}
+	Error poll_error = stream_client->poll();
+	HTTPClient::Status client_status = stream_client->get_status();
+	switch (client_status) {
+		case HTTPClient::STATUS_CANT_RESOLVE: {
+			_fail_stream(String::utf8("Azure OpenAIのホスト名を解決できませんでした。"));
+			return;
+		}
+		case HTTPClient::STATUS_CANT_CONNECT: {
+			_fail_stream(String::utf8("Azure OpenAIに接続できませんでした。"));
+			return;
+		}
+		case HTTPClient::STATUS_TLS_HANDSHAKE_ERROR: {
+			_fail_stream(String::utf8("Azure OpenAIとのTLS接続に失敗しました。"));
+			return;
+		}
+		case HTTPClient::STATUS_CONNECTION_ERROR: {
+			_fail_stream(String::utf8("Azure OpenAIとの接続が切れました。"));
+			return;
+		}
+		default: {
+		}
+	}
+	if (poll_error != OK && client_status != HTTPClient::STATUS_BODY && client_status != HTTPClient::STATUS_CONNECTED) {
+		_fail_stream(vformat(String::utf8("Azure OpenAIとの通信に失敗しました (%s)。"), poll_error));
+		return;
+	}
+	if (client_status == HTTPClient::STATUS_CONNECTED && !stream_request_sent) {
+		Error request_error = stream_client->request(HTTPClient::METHOD_POST, stream_request_path, stream_headers, stream_request_body.ptr(), stream_request_body.size());
+		if (request_error != OK) {
+			_fail_stream(vformat(String::utf8("Azure OpenAIへのリクエストを開始できませんでした (%s)。"), request_error));
+			return;
+		}
+		stream_request_sent = true;
+		return;
+	}
+	if (client_status == HTTPClient::STATUS_BODY) {
+		if (stream_client->has_response()) {
+			stream_response_code = stream_client->get_response_code();
+		}
+		PackedByteArray chunk = stream_client->read_response_body_chunk();
+		if (!chunk.is_empty()) {
+			if (stream_response_code < 200 || stream_response_code >= 300) {
+				stream_error_body.append_array(chunk);
+			} else {
+				stream_raw_body.append_array(chunk);
+				_consume_stream_bytes(chunk);
+			}
+		}
+		return;
+	}
+	if (client_status == HTTPClient::STATUS_CONNECTED && stream_request_sent) {
+		_finish_stream();
+		return;
+	}
+	if (client_status == HTTPClient::STATUS_DISCONNECTED) {
+		if (stream_request_sent && stream_response_code > 0) {
+			_finish_stream();
+		} else {
+			_fail_stream(String::utf8("Azure OpenAIとの接続が切れました。"));
+		}
+	}
+}
+
+void HorrorAIAssistantEditorPlugin::_consume_stream_bytes(const PackedByteArray &p_bytes) {
+	stream_buffer.append_array(p_bytes);
+	while (true) {
+		int newline = stream_buffer.find('\n');
+		if (newline < 0) {
+			return;
+		}
+		PackedByteArray line = stream_buffer.slice(0, newline);
+		stream_buffer = stream_buffer.slice(newline + 1, stream_buffer.size());
+		if (!line.is_empty() && line[line.size() - 1] == '\r') {
+			line.resize(line.size() - 1);
+		}
+		_handle_stream_line(line);
+		if (stream_client.is_null()) {
+			return;
+		}
+	}
+}
+
+void HorrorAIAssistantEditorPlugin::_handle_stream_line(const PackedByteArray &p_line) {
+	if (p_line.is_empty()) {
+		return;
+	}
+	String line = String::utf8((const char *)p_line.ptr(), p_line.size());
+	if (!line.begins_with("data:")) {
+		return;
+	}
+	String event_data = line.substr(5).strip_edges();
+	if (event_data.is_empty() || event_data == "[DONE]") {
+		return;
+	}
+	JSON parser;
+	if (parser.parse(event_data) != OK || parser.get_data().get_type() != Variant::DICTIONARY) {
+		return;
+	}
+	Dictionary event = parser.get_data();
+	String event_type = event.get("type", "");
+	if (event_type == "response.output_text.delta") {
+		stream_text += String(event.get("delta", ""));
+		_update_streaming_reply(stream_text);
+	} else if (event_type == "response.completed") {
+		Dictionary response = event.get("response", Dictionary());
+		_close_stream_transport();
+		_handle_responses_response(response);
+	} else if (event_type == "error" || event_type == "response.failed") {
+		Dictionary response = event.get("response", Dictionary());
+		Dictionary error = event.get("error", response.get("error", Dictionary()));
+		String message = error.get("message", event.get("message", String::utf8("Azure OpenAIのストリームでエラーが発生しました。")));
+		_fail_stream(String::utf8("Azure OpenAIエラー: ") + message);
+	}
+}
+
+void HorrorAIAssistantEditorPlugin::_finish_stream() {
+	if (!stream_buffer.is_empty()) {
+		PackedByteArray final_line = stream_buffer;
+		stream_buffer.clear();
+		_handle_stream_line(final_line);
+		if (stream_client.is_null()) {
+			return;
+		}
+	}
+	int response_code = stream_response_code;
+	if (stream_client.is_valid() && stream_client->has_response()) {
+		response_code = stream_client->get_response_code();
+	}
+	PackedByteArray error_body = stream_error_body;
+	PackedByteArray raw_body = stream_raw_body;
+	_close_stream_transport();
+	if (response_code < 200 || response_code >= 300) {
+		_on_request_completed(HTTPRequest::RESULT_SUCCESS, response_code, PackedStringArray(), error_body);
+		return;
+	}
+	JSON parser;
+	String response_text = String::utf8((const char *)raw_body.ptr(), raw_body.size());
+	if (parser.parse(response_text) == OK && parser.get_data().get_type() == Variant::DICTIONARY) {
+		_handle_responses_response(parser.get_data());
+		return;
+	}
+	_fail_stream(String::utf8("Azure OpenAIのストリームが完了イベントなしで終了しました。"));
+}
+
+void HorrorAIAssistantEditorPlugin::_fail_stream(const String &p_error) {
+	_close_stream_transport();
+	_clear_streaming_reply();
+	_discard_staged_changes();
+	responses_input_items.clear();
+	_set_busy(false, p_error);
+}
+
+void HorrorAIAssistantEditorPlugin::_close_stream_transport() {
+	if (stream_client.is_valid()) {
+		stream_client->close();
+		stream_client.unref();
+	}
+	set_process(false);
+	stream_request_sent = false;
+	stream_request_path.clear();
+	stream_headers.clear();
+	stream_request_body.clear();
+	stream_buffer.clear();
+	stream_error_body.clear();
+	stream_raw_body.clear();
+	stream_response_code = 0;
+	stream_started_msec = 0;
+}
+
+void HorrorAIAssistantEditorPlugin::_begin_streaming_reply() {
+	_clear_streaming_reply();
+	if (!message_list) {
+		return;
+	}
+	streaming_message = memnew(VBoxContainer);
+	streaming_message->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	streaming_body = memnew(RichTextLabel);
+	streaming_body->set_use_bbcode(false);
+	streaming_body->set_fit_content(true);
+	streaming_body->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
+	streaming_body->set_selection_enabled(true);
+	streaming_body->set_text(String::utf8("考えています…"));
+	streaming_message->add_child(streaming_body);
+	message_list->add_child(streaming_message);
+	if (transcript_scroll) {
+		transcript_scroll->call_deferred("ensure_control_visible", streaming_message);
+	}
+}
+
+void HorrorAIAssistantEditorPlugin::_update_streaming_reply(const String &p_text) {
+	if (!streaming_body) {
+		_begin_streaming_reply();
+	}
+	if (streaming_body) {
+		streaming_body->set_text(p_text);
+		if (transcript_scroll) {
+			transcript_scroll->call_deferred("ensure_control_visible", streaming_message);
+		}
+	}
+}
+
+void HorrorAIAssistantEditorPlugin::_clear_streaming_reply() {
+	if (streaming_message) {
+		streaming_message->queue_free();
+		streaming_message = nullptr;
+		streaming_body = nullptr;
+	}
+	stream_text.clear();
 }
 
 void HorrorAIAssistantEditorPlugin::_on_request_completed(int p_result, int p_response_code, const PackedStringArray &p_headers, const PackedByteArray &p_body) {
@@ -975,6 +1206,7 @@ void HorrorAIAssistantEditorPlugin::_on_request_completed(int p_result, int p_re
 	JSON parser;
 	Error parse_error = parser.parse(response_text);
 	if (p_result != HTTPRequest::RESULT_SUCCESS || p_response_code < 200 || p_response_code >= 300) {
+		_clear_streaming_reply();
 		_discard_staged_changes();
 		String error_text;
 		String error_code;
@@ -1005,6 +1237,7 @@ void HorrorAIAssistantEditorPlugin::_on_request_completed(int p_result, int p_re
 		return;
 	}
 	if (parse_error != OK || parser.get_data().get_type() != Variant::DICTIONARY) {
+		_clear_streaming_reply();
 		_discard_staged_changes();
 		_set_busy(false, String::utf8("Azure OpenAIの応答をJSONとして読み取れませんでした。"));
 		return;
@@ -1024,6 +1257,7 @@ void HorrorAIAssistantEditorPlugin::_handle_responses_response(const Dictionary 
 		}
 	}
 	if (!function_calls.is_empty()) {
+		_clear_streaming_reply();
 		if (tool_round >= 6) {
 			_discard_staged_changes();
 			_set_busy(false, String::utf8("ツール実行回数の上限に達しました。指示を分けて続けてください。"));
@@ -1075,6 +1309,7 @@ void HorrorAIAssistantEditorPlugin::_handle_responses_response(const Dictionary 
 	if (answer.is_empty()) {
 		answer = String::utf8("応答は返りましたが、表示できる本文がありませんでした。");
 	}
+	_clear_streaming_reply();
 	_append_message("assistant", answer);
 	_set_busy(false);
 	if (!staged_files.is_empty()) {
@@ -1089,9 +1324,15 @@ void HorrorAIAssistantEditorPlugin::_set_busy(bool p_busy, const String &p_statu
 	if (send_button) {
 		send_button->set_disabled(p_busy);
 	}
-	if (status_label && !p_status.is_empty()) {
-		status_label->set_text(p_status);
-		status_label->set_visible(true);
+	if (status_label) {
+		if (p_busy) {
+			status_label->set_visible(false);
+		} else if (!p_status.is_empty()) {
+			status_label->set_text(p_status);
+			status_label->set_visible(true);
+		} else {
+			status_label->set_visible(false);
+		}
 	}
 }
 
@@ -1141,8 +1382,26 @@ void HorrorAIAssistantEditorPlugin::_record_tool_activity(const String &p_name, 
 }
 
 void HorrorAIAssistantEditorPlugin::_refresh_activity_view() {
-	if (!activity_button || !activity_details) {
+	if (!message_list || activity_entries.is_empty()) {
 		return;
+	}
+	if (!activity_card) {
+		activity_card = memnew(PanelContainer);
+		activity_card->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+		VBoxContainer *card_layout = memnew(VBoxContainer);
+		card_layout->add_theme_constant_override("separation", 3 * EDSCALE);
+		activity_card->add_child(card_layout);
+		activity_button = memnew(Button);
+		activity_button->set_flat(true);
+		activity_button->connect(SceneStringName(pressed), callable_mp(this, &HorrorAIAssistantEditorPlugin::_toggle_activity_details));
+		card_layout->add_child(activity_button);
+		activity_details = memnew(TextEdit);
+		activity_details->set_editable(false);
+		activity_details->set_line_wrapping_mode(TextEdit::LINE_WRAPPING_BOUNDARY);
+		activity_details->set_custom_minimum_size(Size2(0, 150) * EDSCALE);
+		activity_details->set_visible(true);
+		card_layout->add_child(activity_details);
+		message_list->add_child(activity_card);
 	}
 	int edit_count = 0;
 	int operation_count = 0;
@@ -1154,10 +1413,19 @@ void HorrorAIAssistantEditorPlugin::_refresh_activity_view() {
 			operation_count++;
 		}
 	}
-	activity_button->set_visible(!activity_entries.is_empty());
-	activity_button->set_text(vformat(String::utf8("作業ログを%s（編集 %d・調査 %d）"), activity_details->is_visible() ? String::utf8("隠す") : String::utf8("表示"), edit_count, operation_count));
+	String summary;
+	if (edit_count > 0) {
+		summary += vformat(String::utf8("ファイルを編集しました (%d)"), edit_count);
+	}
+	if (operation_count > 0) {
+		if (!summary.is_empty()) {
+			summary += "  ·  ";
+		}
+		summary += vformat(String::utf8("プロジェクトを調査しました (%d)"), operation_count);
+	}
+	activity_button->set_text(summary + (activity_details->is_visible() ? "  ▲" : "  ▼"));
 
-	String details = String::utf8("Mina AI の作業履歴\n\n調査・読み込み\n");
+	String details = String::utf8("実行した作業\n");
 	for (int i = 0; i < activity_entries.size(); i++) {
 		Dictionary entry = activity_entries[i];
 		if (String(entry.get("kind", "")) != "edit") {
@@ -1638,7 +1906,11 @@ void HorrorAIAssistantEditorPlugin::_notification(int p_what) {
 		case NOTIFICATION_ENTER_TREE: {
 			_build_panel();
 		} break;
+		case NOTIFICATION_PROCESS: {
+			_poll_stream();
+		} break;
 		case NOTIFICATION_EXIT_TREE: {
+			_close_stream_transport();
 			if (dock) {
 				EditorDockManager::get_singleton()->remove_dock(dock);
 				memdelete(dock);

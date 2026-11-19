@@ -13,6 +13,7 @@
 #include "editor/plugins/editor_plugin.h"
 
 #include "core/io/config_file.h"
+#include "core/io/http_client.h"
 #include "core/variant/array.h"
 #include "core/variant/dictionary.h"
 
@@ -25,6 +26,7 @@ class Label;
 class LineEdit;
 class Node;
 class ItemList;
+class PanelContainer;
 class RichTextLabel;
 class ScrollContainer;
 class TextEdit;
@@ -35,7 +37,6 @@ class HorrorAIAssistantEditorPlugin : public EditorPlugin {
 	GDCLASS(HorrorAIAssistantEditorPlugin, EditorPlugin);
 
 	EditorDock *dock = nullptr;
-	HTTPRequest *http_request = nullptr;
 	ScrollContainer *transcript_scroll = nullptr;
 	VBoxContainer *message_list = nullptr;
 	FileDialog *image_file_dialog = nullptr;
@@ -51,7 +52,10 @@ class HorrorAIAssistantEditorPlugin : public EditorPlugin {
 	Window *settings_window = nullptr;
 	Window *session_history_window = nullptr;
 	ItemList *session_history_list = nullptr;
+	PanelContainer *activity_card = nullptr;
 	TextEdit *activity_details = nullptr;
+	RichTextLabel *streaming_body = nullptr;
+	VBoxContainer *streaming_message = nullptr;
 	LineEdit *endpoint_input = nullptr;
 	LineEdit *deployment_input = nullptr;
 	LineEdit *api_key_input = nullptr;
@@ -63,14 +67,25 @@ class HorrorAIAssistantEditorPlugin : public EditorPlugin {
 	Array session_ids;
 	String system_instructions;
 	String current_session_id;
+	String stream_request_path;
+	String stream_text;
 	Dictionary staged_files;
 	String api_key;
 	String last_request_url;
 	Ref<ConfigFile> saved_settings;
 	Ref<ConfigFile> session_storage;
+	Ref<HTTPClient> stream_client;
+	Vector<String> stream_headers;
+	PackedByteArray stream_request_body;
+	PackedByteArray stream_buffer;
+	PackedByteArray stream_error_body;
+	PackedByteArray stream_raw_body;
 	int tool_round = 0;
+	int stream_response_code = 0;
+	uint64_t stream_started_msec = 0;
 	bool busy = false;
 	bool restoring_session = false;
+	bool stream_request_sent = false;
 
 	void _build_panel();
 	void _build_settings_window();
@@ -82,6 +97,15 @@ class HorrorAIAssistantEditorPlugin : public EditorPlugin {
 	void _load_session_from_history_item(int p_index);
 	void _load_session(const String &p_session_id);
 	void _save_current_session();
+	void _poll_stream();
+	void _consume_stream_bytes(const PackedByteArray &p_bytes);
+	void _handle_stream_line(const PackedByteArray &p_line);
+	void _finish_stream();
+	void _fail_stream(const String &p_error);
+	void _close_stream_transport();
+	void _begin_streaming_reply();
+	void _update_streaming_reply(const String &p_text);
+	void _clear_streaming_reply();
 	void _open_image_dialog();
 	void _on_images_selected(const PackedStringArray &p_paths);
 	void _clear_image_attachments();
