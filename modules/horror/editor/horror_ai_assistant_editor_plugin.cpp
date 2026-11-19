@@ -22,6 +22,7 @@
 #include "editor/editor_interface.h"
 #include "editor/file_system/editor_paths.h"
 #include "editor/file_system/editor_file_system.h"
+#include "editor/script/script_editor_plugin.h"
 #include "editor/settings/editor_settings.h"
 #include "editor/themes/editor_scale.h"
 #include "scene/gui/box_container.h"
@@ -38,7 +39,7 @@
 #include "scene/gui/text_edit.h"
 #include "scene/main/http_request.h"
 #include "scene/resources/style_box_flat.h"
-#include "servers/display_server.h"
+#include "servers/display/display_server.h"
 
 #ifdef WINDOWS_ENABLED
 #include <windows.h>
@@ -377,7 +378,7 @@ void HorrorAIAssistantEditorPlugin::_append_message(const String &p_role, const 
 		}
 		bubble_style->set_corner_radius_all(16 * EDSCALE);
 		bubble_style->set_content_margin_all(12 * EDSCALE);
-		bubble->add_theme_stylebox_override("panel", bubble_style);
+		bubble->add_theme_style_override("panel", bubble_style);
 		message_row->add_child(bubble);
 		body->set_custom_minimum_size(Size2(MAX(48 * EDSCALE, bubble_width - 24 * EDSCALE), 0));
 		bubble->add_child(body);
@@ -466,6 +467,7 @@ void HorrorAIAssistantEditorPlugin::_save_settings() {
 #ifdef WINDOWS_ENABLED
 		if (encrypted_key.is_empty()) {
 			status_label->set_text(String::utf8("APIキーをWindowsで暗号化して保存できませんでした。環境変数 AZURE_OPENAI_API_KEY を使ってください。"));
+			status_label->set_visible(true);
 			return;
 		}
 		saved_settings->set_value("mina/ai", "azure_api_key_dpapi", encrypted_key);
@@ -476,10 +478,12 @@ void HorrorAIAssistantEditorPlugin::_save_settings() {
 	Error save_error = saved_settings->save(_get_saved_settings_path());
 	if (save_error != OK) {
 		status_label->set_text(vformat(String::utf8("設定を保存できませんでした (%d)。"), save_error));
+		status_label->set_visible(true);
 		return;
 	}
 	settings_window->hide();
 	status_label->set_text(api_key.is_empty() ? String::utf8("APIキーを入力するか AZURE_OPENAI_API_KEY を設定してください。") : String::utf8("Azure OpenAIの設定を保存しました。"));
+	status_label->set_visible(true);
 }
 
 void HorrorAIAssistantEditorPlugin::_send_prompt() {
@@ -1097,6 +1101,8 @@ void HorrorAIAssistantEditorPlugin::_apply_changes() {
 	}
 	EditorInterface *editor_interface = EditorInterface::get_singleton();
 	PackedStringArray unsaved_scenes = editor_interface->get_unsaved_scenes();
+	ScriptEditor *script_editor = editor_interface->get_script_editor();
+	PackedStringArray unsaved_scripts = script_editor ? script_editor->get_unsaved_files() : PackedStringArray();
 	Array paths = staged_files.keys();
 	for (int i = 0; i < paths.size(); i++) {
 		String path = paths[i];
@@ -1121,6 +1127,11 @@ void HorrorAIAssistantEditorPlugin::_apply_changes() {
 		}
 		if (unsaved_scenes.has(path) || unsaved_scenes.has(ProjectSettings::get_singleton()->globalize_path(path))) {
 			_set_busy(false, String::utf8("未保存のシーンがあるため適用できません。シーンを保存してから再度依頼してください。"));
+			_discard_staged_changes();
+			return;
+		}
+		if (unsaved_scripts.has(path) || unsaved_scripts.has(ProjectSettings::get_singleton()->globalize_path(path))) {
+			_set_busy(false, String::utf8("未保存のスクリプトがあるため適用できません。スクリプトを保存してから再度依頼してください。"));
 			_discard_staged_changes();
 			return;
 		}
@@ -1200,7 +1211,6 @@ void HorrorAIAssistantEditorPlugin::_apply_changes() {
 	if (!active_scene_path.is_empty() && staged_files.has(active_scene_path)) {
 		editor_interface->reload_scene_from_path(active_scene_path);
 	}
-	int changed_count = staged_files.size();
 	for (int i = 0; i < activity_entries.size(); i++) {
 		Dictionary entry = activity_entries[i];
 		if (String(entry.get("kind", "")) == "edit" && paths.has(entry.get("path", ""))) {
