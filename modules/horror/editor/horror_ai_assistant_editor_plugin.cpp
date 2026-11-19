@@ -31,6 +31,7 @@
 #include "scene/gui/control.h"
 #include "scene/gui/dialogs.h"
 #include "scene/gui/file_dialog.h"
+#include "scene/gui/item_list.h"
 #include "scene/gui/label.h"
 #include "scene/gui/line_edit.h"
 #include "scene/gui/margin_container.h"
@@ -108,6 +109,19 @@ Error _save_saved_settings(const Ref<ConfigFile> &p_settings) {
 	return p_settings->save(path);
 }
 
+String _get_session_storage_path() {
+	return OS::get_singleton()->get_user_data_dir().path_join("mina_ai_sessions.cfg");
+}
+
+Error _save_session_storage(const Ref<ConfigFile> &p_session_storage) {
+	String path = _get_session_storage_path();
+	Error dir_error = DirAccess::make_dir_recursive_absolute(path.get_base_dir());
+	if (dir_error != OK && dir_error != ERR_ALREADY_EXISTS) {
+		return dir_error;
+	}
+	return p_session_storage->save(path);
+}
+
 String _encrypt_api_key(const String &p_api_key) {
 #ifdef WINDOWS_ENABLED
 	CharString key_utf8 = p_api_key.utf8();
@@ -149,6 +163,7 @@ String _decrypt_api_key(const String &p_encrypted_key) {
 
 void HorrorAIAssistantEditorPlugin::_build_panel() {
 	_load_settings();
+	_load_session_history();
 	dock = memnew(EditorDock);
 	dock->set_name("MinaAIAssistantDock");
 	dock->set_title(String::utf8("Mina AI"));
@@ -165,6 +180,11 @@ void HorrorAIAssistantEditorPlugin::_build_panel() {
 	session_title->set_text(String::utf8("新しいセッション"));
 	session_title->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 	header->add_child(session_title);
+	history_button = memnew(Button);
+	history_button->set_text(String::utf8("履歴"));
+	history_button->set_tooltip_text(String::utf8("過去のチャットを開く"));
+	history_button->connect(SceneStringName(pressed), callable_mp(this, &HorrorAIAssistantEditorPlugin::_show_session_history));
+	header->add_child(history_button);
 	Button *new_session_button = memnew(Button);
 	new_session_button->set_text(String::utf8("新規"));
 	new_session_button->set_tooltip_text(String::utf8("新しいセッション"));
@@ -254,6 +274,7 @@ void HorrorAIAssistantEditorPlugin::_build_panel() {
 	dock->add_child(image_file_dialog);
 
 	_build_settings_window();
+	_build_session_history_window();
 	EditorDockManager::get_singleton()->add_dock(dock);
 	dock->make_visible();
 	_start_new_session();
@@ -261,6 +282,7 @@ void HorrorAIAssistantEditorPlugin::_build_panel() {
 
 void HorrorAIAssistantEditorPlugin::_build_settings_window() {
 	settings_window = memnew(Window);
+	settings_window->set_visible(false);
 	settings_window->set_title(String::utf8("Azure OpenAI 接続設定"));
 	settings_window->set_size(Size2i(560, 390));
 	settings_window->set_exclusive(true);
@@ -318,6 +340,166 @@ void HorrorAIAssistantEditorPlugin::_build_settings_window() {
 	save_button->connect(SceneStringName(pressed), callable_mp(this, &HorrorAIAssistantEditorPlugin::_save_settings));
 	buttons->add_child(save_button);
 	layout->add_child(buttons);
+}
+
+void HorrorAIAssistantEditorPlugin::_build_session_history_window() {
+	session_history_window = memnew(Window);
+	session_history_window->set_visible(false);
+	session_history_window->set_title(String::utf8("チャット履歴"));
+	session_history_window->set_size(Size2i(420, 460));
+	session_history_window->set_exclusive(true);
+	dock->add_child(session_history_window);
+
+	VBoxContainer *layout = memnew(VBoxContainer);
+	layout->set_anchors_and_offsets_preset(Control::PRESET_FULL_RECT);
+	layout->add_theme_constant_override("separation", 8 * EDSCALE);
+	session_history_window->add_child(layout);
+	session_history_list = memnew(ItemList);
+	session_history_list->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	session_history_list->set_v_size_flags(Control::SIZE_EXPAND_FILL);
+	session_history_list->connect("item_activated", callable_mp(this, &HorrorAIAssistantEditorPlugin::_load_session_from_history_item));
+	layout->add_child(session_history_list);
+
+	HBoxContainer *buttons = memnew(HBoxContainer);
+	buttons->set_alignment(BoxContainer::ALIGNMENT_END);
+	Button *close_button = memnew(Button);
+	close_button->set_text(String::utf8("閉じる"));
+	close_button->connect(SceneStringName(pressed), callable_mp(session_history_window, &Window::hide));
+	buttons->add_child(close_button);
+	Button *open_button = memnew(Button);
+	open_button->set_text(String::utf8("開く"));
+	open_button->connect(SceneStringName(pressed), callable_mp(this, &HorrorAIAssistantEditorPlugin::_open_selected_session));
+	buttons->add_child(open_button);
+	layout->add_child(buttons);
+	_refresh_session_history_list();
+}
+
+void HorrorAIAssistantEditorPlugin::_load_session_history() {
+	session_storage.instantiate();
+	Error load_error = session_storage->load(_get_session_storage_path());
+	if (load_error != OK && load_error != ERR_FILE_NOT_FOUND) {
+		WARN_PRINT(vformat("Could not load Mina AI chat history (error %d).", load_error));
+	}
+	session_ids = session_storage->get_value("history", "ids", Array());
+}
+
+void HorrorAIAssistantEditorPlugin::_refresh_session_history_list() {
+	if (!session_history_list || session_storage.is_null()) {
+		return;
+	}
+	session_history_list->clear();
+	session_ids = session_storage->get_value("history", "ids", Array());
+	for (int i = 0; i < session_ids.size(); i++) {
+		String session_id = session_ids[i];
+		String section = "thread_" + session_id;
+		if (!session_storage->has_section(section)) {
+			continue;
+		}
+		String title = session_storage->get_value(section, "title", String::utf8("チャット"));
+		int item = session_history_list->add_item(title);
+		session_history_list->set_item_metadata(item, session_id);
+	}
+}
+
+void HorrorAIAssistantEditorPlugin::_show_session_history() {
+	if (!session_history_window) {
+		return;
+	}
+	_refresh_session_history_list();
+	session_history_window->popup_centered_clamped(Size2i(420, 460));
+}
+
+void HorrorAIAssistantEditorPlugin::_open_selected_session() {
+	if (!session_history_list || !session_history_window) {
+		return;
+	}
+	Vector<int> selected = session_history_list->get_selected_items();
+	if (selected.is_empty()) {
+		return;
+	}
+	_load_session(String(session_history_list->get_item_metadata(selected[0])));
+}
+
+void HorrorAIAssistantEditorPlugin::_load_session_from_history_item(int p_index) {
+	if (!session_history_list) {
+		return;
+	}
+	_load_session(String(session_history_list->get_item_metadata(p_index)));
+}
+
+void HorrorAIAssistantEditorPlugin::_load_session(const String &p_session_id) {
+	if (busy || session_storage.is_null() || p_session_id.is_empty()) {
+		return;
+	}
+	String section = "thread_" + p_session_id;
+	if (!session_storage->has_section(section)) {
+		return;
+	}
+	Array saved_messages = session_storage->get_value(section, "messages", Array());
+	_start_new_session();
+	current_session_id = p_session_id;
+	conversation_messages = saved_messages;
+	if (session_title) {
+		session_title->set_text(session_storage->get_value(section, "title", String::utf8("チャット")));
+	}
+	if (message_list) {
+		for (int i = 0; i < message_list->get_child_count(); i++) {
+			message_list->get_child(i)->queue_free();
+		}
+	}
+	responses_input_items.clear();
+	restoring_session = true;
+	for (int i = 0; i < saved_messages.size(); i++) {
+		Dictionary saved_message = saved_messages[i];
+		String role = saved_message.get("role", "assistant");
+		String message_text = saved_message.get("text", "");
+		Array images = saved_message.get("images", Array());
+		_append_message(role, message_text, images);
+
+		Dictionary context_message;
+		context_message["type"] = "message";
+		context_message["role"] = role;
+		Array content;
+		Dictionary text_part;
+		text_part["type"] = role == "user" ? "input_text" : "output_text";
+		String context_text = message_text;
+		if (role == "user" && !images.is_empty()) {
+			context_text += context_text.is_empty() ? String() : "\n";
+			context_text += String::utf8("以前添付した画像: ");
+			for (int j = 0; j < images.size(); j++) {
+				if (j > 0) {
+					context_text += ", ";
+				}
+				context_text += String(images[j]).get_file();
+			}
+		}
+		text_part["text"] = context_text;
+		content.push_back(text_part);
+		context_message["content"] = content;
+		responses_input_items.push_back(context_message);
+	}
+	restoring_session = false;
+	if (session_history_window) {
+		session_history_window->hide();
+	}
+}
+
+void HorrorAIAssistantEditorPlugin::_save_current_session() {
+	if (current_session_id.is_empty() || conversation_messages.is_empty() || session_storage.is_null()) {
+		return;
+	}
+	String section = "thread_" + current_session_id;
+	session_storage->set_value(section, "title", session_title ? session_title->get_text() : String::utf8("チャット"));
+	session_storage->set_value(section, "messages", conversation_messages);
+	if (!session_ids.has(current_session_id)) {
+		session_ids.push_front(current_session_id);
+	}
+	session_storage->set_value("history", "ids", session_ids);
+	Error save_error = _save_session_storage(session_storage);
+	if (save_error != OK) {
+		WARN_PRINT(vformat("Could not save Mina AI chat history (error %d).", save_error));
+	}
+	_refresh_session_history_list();
 }
 
 void HorrorAIAssistantEditorPlugin::_open_image_dialog() {
@@ -449,6 +631,8 @@ void HorrorAIAssistantEditorPlugin::_start_new_session() {
 		_discard_staged_changes();
 	}
 	responses_input_items.clear();
+	conversation_messages.clear();
+	current_session_id.clear();
 	_clear_image_attachments();
 	activity_entries.clear();
 	if (activity_button) {
@@ -582,6 +766,14 @@ void HorrorAIAssistantEditorPlugin::_append_message(const String &p_role, const 
 	}
 	if (transcript_scroll) {
 		transcript_scroll->call_deferred("ensure_control_visible", message);
+	}
+	if (!restoring_session && !current_session_id.is_empty()) {
+		Dictionary saved_message;
+		saved_message["role"] = p_role;
+		saved_message["text"] = p_text;
+		saved_message["images"] = p_image_paths;
+		conversation_messages.push_back(saved_message);
+		_save_current_session();
 	}
 }
 
@@ -724,6 +916,12 @@ void HorrorAIAssistantEditorPlugin::_send_prompt() {
 	response_input_message["type"] = "message";
 	response_input_message["role"] = "user";
 	response_input_message["content"] = message_content;
+	if (current_session_id.is_empty()) {
+		current_session_id = String::num_uint64(OS::get_singleton()->get_ticks_usec());
+		while (session_ids.has(current_session_id)) {
+			current_session_id += "x";
+		}
+	}
 	responses_input_items.push_back(response_input_message);
 	_append_message("user", prompt, pending_image_paths);
 	_clear_image_attachments();
