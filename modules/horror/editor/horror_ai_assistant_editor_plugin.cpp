@@ -227,9 +227,9 @@ void HorrorAIAssistantEditorPlugin::_build_settings_window() {
 
 	Label *description = memnew(Label);
 #ifdef WINDOWS_ENABLED
-	description->set_text(String::utf8("Azure OpenAIのEndpointとデプロイ名を入力します。API version に latest を指定するとOpenAI v1を使います。APIキーはWindowsユーザーアカウントで暗号化して保存します。"));
+	description->set_text(String::utf8("API version に latest を指定するかEndpointに /openai/v1 を含めると、推論モデル対応のResponses APIを使います。APIキーはWindowsユーザーアカウントで暗号化して保存します。"));
 #else
-	description->set_text(String::utf8("Azure OpenAIのEndpointとデプロイ名を入力します。API version に latest を指定するとOpenAI v1を使います。APIキーは AZURE_OPENAI_API_KEY 環境変数で設定してください。"));
+	description->set_text(String::utf8("API version に latest を指定するかEndpointに /openai/v1 を含めると、推論モデル対応のResponses APIを使います。APIキーは AZURE_OPENAI_API_KEY 環境変数で設定してください。"));
 #endif
 	description->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
 	layout->add_child(description);
@@ -253,7 +253,7 @@ void HorrorAIAssistantEditorPlugin::_build_settings_window() {
 
 	endpoint_input = add_setting_row(String::utf8("Endpoint"), "https://<resource>.openai.azure.com", false);
 	deployment_input = add_setting_row(String::utf8("Deployment"), "deployment-name", false);
-	api_version_input = add_setting_row(String::utf8("API version"), String::utf8("2024-10-21 / latest (OpenAI v1)"), false);
+	api_version_input = add_setting_row(String::utf8("API version"), String::utf8("2024-10-21 / latest (Responses API)"), false);
 	api_key_input = add_setting_row(String::utf8("API key"), String::utf8("AZURE_OPENAI_API_KEYでも設定できます"), true);
 
 	HBoxContainer *buttons = memnew(HBoxContainer);
@@ -301,6 +301,7 @@ void HorrorAIAssistantEditorPlugin::_start_new_session() {
 		return;
 	}
 	messages.clear();
+	responses_input_items.clear();
 	Dictionary system_message;
 	system_message["role"] = "system";
 	system_message["content"] = String::utf8(
@@ -399,6 +400,11 @@ void HorrorAIAssistantEditorPlugin::_send_prompt() {
 	user_message["role"] = "user";
 	user_message["content"] = prompt;
 	messages.push_back(user_message);
+	Dictionary response_input_message;
+	response_input_message["type"] = "message";
+	response_input_message["role"] = "user";
+	response_input_message["content"] = prompt;
+	responses_input_items.push_back(response_input_message);
 	_append_message("user", prompt);
 	prompt_input->clear();
 	tool_round = 0;
@@ -425,23 +431,33 @@ void HorrorAIAssistantEditorPlugin::_request_next_turn() {
 	bool use_v1 = api_version.to_lower() == "latest" || endpoint_lower.ends_with("/openai/v1") || endpoint_lower.contains(".services.ai.azure.com");
 	String url;
 	if (use_v1) {
-		url = endpoint_lower.ends_with("/openai/v1") ? endpoint + "/chat/completions" : endpoint + "/openai/v1/chat/completions";
+		url = endpoint_lower.ends_with("/openai/v1") ? endpoint + "/responses" : endpoint + "/openai/v1/responses";
 	} else {
 		url = endpoint + "/openai/deployments/" + deployment.uri_encode() + "/chat/completions?api-version=" + api_version.uri_encode();
 	}
 	last_request_url = url;
+	current_request_uses_responses_api = use_v1;
 	Dictionary request_body;
-	request_body["messages"] = messages;
-	request_body["tools"] = _get_tool_schemas();
-	request_body["tool_choice"] = "auto";
 	if (use_v1) {
 		request_body["model"] = deployment;
+		Dictionary system_message = messages[0];
+		request_body["instructions"] = system_message.get("content", "");
+		request_body["input"] = responses_input_items;
+		request_body["tools"] = _get_responses_tool_schemas();
+		request_body["tool_choice"] = "auto";
+	} else {
+		request_body["messages"] = messages;
+		request_body["tools"] = _get_tool_schemas();
+		request_body["tool_choice"] = "auto";
 	}
 	Vector<String> headers;
 	headers.push_back("Content-Type: application/json");
 	headers.push_back("api-key: " + api_key);
 	Error error = http_request->request(url, headers, HTTPClient::METHOD_POST, JSON::stringify(request_body));
 	if (error != OK) {
+		if (use_v1) {
+			responses_input_items.clear();
+		}
 		_set_busy(false, vformat(String::utf8("Azure OpenAIへのリクエストを開始できませんでした (%s)。"), error));
 	}
 }
@@ -478,6 +494,9 @@ void HorrorAIAssistantEditorPlugin::_on_request_completed(int p_result, int p_re
 			status += String::utf8("\n要求URL: ") + last_request_url;
 			status += String::utf8("\nEndpointがAzureリソースのURLか、DeploymentがAzure上のデプロイ名と完全一致するか確認してください。Azure OpenAI v1を使う場合はAPI versionに latest を指定できます。");
 		}
+		if (current_request_uses_responses_api) {
+			responses_input_items.clear();
+		}
 		_set_busy(false, status);
 		return;
 	}
@@ -486,6 +505,10 @@ void HorrorAIAssistantEditorPlugin::_on_request_completed(int p_result, int p_re
 		return;
 	}
 	Dictionary response = parser.get_data();
+	if (current_request_uses_responses_api) {
+		_handle_responses_response(response);
+		return;
+	}
 	Array choices = response.get("choices", Array());
 	if (choices.is_empty()) {
 		_set_busy(false, String::utf8("Azure OpenAIから応答がありませんでした。"));
@@ -531,6 +554,74 @@ void HorrorAIAssistantEditorPlugin::_on_request_completed(int p_result, int p_re
 	_update_pending_changes();
 }
 
+void HorrorAIAssistantEditorPlugin::_handle_responses_response(const Dictionary &p_response) {
+	Array output = p_response.get("output", Array());
+	Array function_calls;
+	for (int i = 0; i < output.size(); i++) {
+		Dictionary item = output[i];
+		responses_input_items.push_back(item);
+		if (String(item.get("type", "")) == "function_call") {
+			function_calls.push_back(item);
+		}
+	}
+	if (!function_calls.is_empty()) {
+		if (tool_round >= 6) {
+			_set_busy(false, String::utf8("ツール実行回数の上限に達しました。指示を分けて続けてください。"));
+			return;
+		}
+		for (int i = 0; i < function_calls.size(); i++) {
+			Dictionary call = function_calls[i];
+			String arguments_text = call.get("arguments", "{}");
+			JSON arguments_parser;
+			Dictionary arguments;
+			Dictionary result;
+			if (arguments_parser.parse(arguments_text) == OK && arguments_parser.get_data().get_type() == Variant::DICTIONARY) {
+				arguments = arguments_parser.get_data();
+				result = _execute_tool(call.get("name", ""), arguments);
+			} else {
+				result["ok"] = false;
+				result["error"] = "Function arguments were not a JSON object.";
+			}
+			Dictionary tool_output;
+			tool_output["type"] = "function_call_output";
+			tool_output["call_id"] = call.get("call_id", "");
+			tool_output["output"] = JSON::stringify(result);
+			responses_input_items.push_back(tool_output);
+		}
+		tool_round++;
+		_set_busy(true, String::utf8("プロジェクトを調査・編集しています…"));
+		_request_next_turn();
+		return;
+	}
+	String answer = p_response.get("output_text", "");
+	if (answer.is_empty()) {
+		for (int i = 0; i < output.size(); i++) {
+			Dictionary item = output[i];
+			if (String(item.get("type", "")) != "message") {
+				continue;
+			}
+			Array content = item.get("content", Array());
+			for (int j = 0; j < content.size(); j++) {
+				Dictionary part = content[j];
+				String part_type = part.get("type", "");
+				if (part_type == "output_text" || part_type == "refusal") {
+					answer += String(part.get("text", part.get("refusal", "")));
+				}
+			}
+		}
+	}
+	if (answer.is_empty()) {
+		answer = String::utf8("応答は返りましたが、表示できる本文がありませんでした。");
+	}
+	Dictionary assistant_message;
+	assistant_message["role"] = "assistant";
+	assistant_message["content"] = answer;
+	messages.push_back(assistant_message);
+	_append_message("assistant", answer);
+	_set_busy(false, staged_files.is_empty() ? String::utf8("応答しました。") : String::utf8("変更案を確認して適用できます。"));
+	_update_pending_changes();
+}
+
 void HorrorAIAssistantEditorPlugin::_set_busy(bool p_busy, const String &p_status) {
 	busy = p_busy;
 	if (send_button) {
@@ -570,6 +661,21 @@ Array HorrorAIAssistantEditorPlugin::_get_tool_schemas() const {
 	required.push_back("content");
 	required.push_back("reason");
 	tools.push_back(_function_tool("stage_project_file", "ファイル全体の変更案をステージします。実際の書き込みはユーザーが一覧を確認してから行われます。既存ファイルは先にread_project_fileで読んでください。", properties, required));
+	return tools;
+}
+
+Array HorrorAIAssistantEditorPlugin::_get_responses_tool_schemas() const {
+	Array tools;
+	Array chat_tools = _get_tool_schemas();
+	for (int i = 0; i < chat_tools.size(); i++) {
+		Dictionary function = Dictionary(chat_tools[i]).get("function", Dictionary());
+		Dictionary tool;
+		tool["type"] = "function";
+		tool["name"] = function.get("name", "");
+		tool["description"] = function.get("description", "");
+		tool["parameters"] = function.get("parameters", Dictionary());
+		tools.push_back(tool);
+	}
 	return tools;
 }
 

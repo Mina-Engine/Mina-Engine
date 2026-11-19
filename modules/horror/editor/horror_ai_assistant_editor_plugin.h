@@ -47,12 +47,14 @@ class HorrorAIAssistantEditorPlugin : public EditorPlugin {
 	ConfirmationDialog *apply_dialog = nullptr;
 
 	Array messages;
+	Array responses_input_items;
 	Dictionary staged_files;
 	String api_key;
 	String last_request_url;
 	Ref<ConfigFile> saved_settings;
 	int tool_round = 0;
 	bool busy = false;
+	bool current_request_uses_responses_api = false;
 
 	void _build_panel();
 	void _build_settings_window();
@@ -62,6 +64,7 @@ class HorrorAIAssistantEditorPlugin : public EditorPlugin {
 	void _send_prompt();
 	void _request_next_turn();
 	void _on_request_completed(int p_result, int p_response_code, const PackedStringArray &p_headers, const PackedByteArray &p_body);
+	void _handle_responses_response(const Dictionary &p_response);
 	void _set_busy(bool p_busy, const String &p_status = String());
 	void _show_settings();
 	void _save_settings();
@@ -70,6 +73,7 @@ class HorrorAIAssistantEditorPlugin : public EditorPlugin {
 	void _apply_changes();
 
 	Array _get_tool_schemas() const;
+	Array _get_responses_tool_schemas() const;
 	Dictionary _execute_tool(const String &p_name, const Dictionary &p_arguments);
 	Dictionary _list_project_files(const String &p_directory, bool p_audio_only) const;
 	void _collect_project_files(const String &p_directory, Array &r_files, int p_limit, bool p_audio_only, int &r_count) const;
