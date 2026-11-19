@@ -180,7 +180,7 @@ void HorrorAIAssistantEditorPlugin::_build_panel() {
 
 	HBoxContainer *input_footer = memnew(HBoxContainer);
 	Label *privacy_note = memnew(Label);
-	privacy_note->set_text(String::utf8("変更は確認後に適用"));
+	privacy_note->set_text(String::utf8("変更は自動適用・バックアップあり"));
 	privacy_note->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 	input_footer->add_child(privacy_note);
 	send_button = memnew(Button);
@@ -293,9 +293,7 @@ void HorrorAIAssistantEditorPlugin::_start_new_session() {
 		return;
 	}
 	if (!staged_files.is_empty()) {
-		status_label->set_text(String::utf8("先に未適用の変更案を確認してください。"));
-		status_label->set_visible(true);
-		return;
+		_discard_staged_changes();
 	}
 	responses_input_items.clear();
 	activity_entries.clear();
@@ -309,7 +307,7 @@ void HorrorAIAssistantEditorPlugin::_start_new_session() {
 	system_instructions = String::utf8(
 			"あなたは Mina Engine に組み込まれたゲーム制作エージェントです。Godot 4.7.2 のプロジェクトを調査し、ユーザーの指示に沿ってシーン、GDScript、音響の配置、演出イベントをまとめて制作します。日本語で応答してください。\n"
 			"必ず利用可能なツールでプロジェクト構成と対象ファイルを調べてから編集案を作ってください。音声などのバイナリアセットを捏造せず、既存音声一覧から選んでください。必要な場合は .tscn と .gd を一緒に作成し、イベントのタイミングや音の再生、照明変化はスクリプトで実装してください。\n"
-			"ファイル変更は stage_project_file だけで提案してください。既存ファイルを読む前に置き換えないでください。すべてのパスは res:// 以下で、テキスト形式のファイルだけを扱います。変更案はユーザーが一括確認してから適用されます。"
+			"ファイル変更は stage_project_file だけで提案してください。既存ファイルを読む前に置き換えないでください。すべてのパスは res:// 以下で、テキスト形式のファイルだけを扱います。AIの回答が完了した後、変更案はバックアップを作成して自動適用されます。"
 	);
 	if (message_list) {
 		for (int i = 0; i < message_list->get_child_count(); i++) {
@@ -502,7 +500,7 @@ void HorrorAIAssistantEditorPlugin::_send_prompt() {
 		return;
 	}
 	if (responses_input_items.is_empty() && session_title && session_title->get_text() == String::utf8("新しいセッション")) {
-		String title = prompt.replace("\n", " ").strip_edges();
+		String title = prompt.replace("\n", " ").replace("\t", " ").strip_edges();
 		if (title.length() > 28) {
 			title = title.substr(0, 27) + "…";
 		}
@@ -526,11 +524,13 @@ void HorrorAIAssistantEditorPlugin::_request_next_turn() {
 		endpoint = endpoint.substr(0, endpoint.length() - 1);
 	}
 	if (!endpoint.begins_with("https://")) {
+		_discard_staged_changes();
 		_set_busy(false, String::utf8("Endpointには https:// から始まるAzure OpenAI URLを入力してください。"));
 		return;
 	}
 	String deployment = _get_setting("mina/ai/azure_deployment", "").strip_edges();
 	if (deployment.is_empty()) {
+		_discard_staged_changes();
 		_set_busy(false, String::utf8("Deploymentを設定してください。"));
 		return;
 	}
@@ -549,6 +549,7 @@ void HorrorAIAssistantEditorPlugin::_request_next_turn() {
 	Error error = http_request->request(url, headers, HTTPClient::METHOD_POST, JSON::stringify(request_body));
 	if (error != OK) {
 		responses_input_items.clear();
+		_discard_staged_changes();
 		_set_busy(false, vformat(String::utf8("Azure OpenAIへのリクエストを開始できませんでした (%s)。"), error));
 	}
 }
@@ -561,6 +562,7 @@ void HorrorAIAssistantEditorPlugin::_on_request_completed(int p_result, int p_re
 	JSON parser;
 	Error parse_error = parser.parse(response_text);
 	if (p_result != HTTPRequest::RESULT_SUCCESS || p_response_code < 200 || p_response_code >= 300) {
+		_discard_staged_changes();
 		String error_text;
 		String error_code;
 		if (parse_error == OK && parser.get_data().get_type() == Variant::DICTIONARY) {
@@ -590,6 +592,7 @@ void HorrorAIAssistantEditorPlugin::_on_request_completed(int p_result, int p_re
 		return;
 	}
 	if (parse_error != OK || parser.get_data().get_type() != Variant::DICTIONARY) {
+		_discard_staged_changes();
 		_set_busy(false, String::utf8("Azure OpenAIの応答をJSONとして読み取れませんでした。"));
 		return;
 	}
@@ -609,6 +612,7 @@ void HorrorAIAssistantEditorPlugin::_handle_responses_response(const Dictionary 
 	}
 	if (!function_calls.is_empty()) {
 		if (tool_round >= 6) {
+			_discard_staged_changes();
 			_set_busy(false, String::utf8("ツール実行回数の上限に達しました。指示を分けて続けてください。"));
 			return;
 		}
@@ -659,8 +663,12 @@ void HorrorAIAssistantEditorPlugin::_handle_responses_response(const Dictionary 
 		answer = String::utf8("応答は返りましたが、表示できる本文がありませんでした。");
 	}
 	_append_message("assistant", answer);
-	_set_busy(false, staged_files.is_empty() ? String::utf8("応答しました。") : String::utf8("変更案を確認して適用できます。"));
-	_update_pending_changes();
+	_set_busy(false);
+	if (!staged_files.is_empty()) {
+		_apply_changes();
+	} else if (status_label) {
+		status_label->set_visible(false);
+	}
 }
 
 void HorrorAIAssistantEditorPlugin::_set_busy(bool p_busy, const String &p_status) {
@@ -670,6 +678,7 @@ void HorrorAIAssistantEditorPlugin::_set_busy(bool p_busy, const String &p_statu
 	}
 	if (status_label && !p_status.is_empty()) {
 		status_label->set_text(p_status);
+		status_label->set_visible(true);
 	}
 }
 
@@ -752,7 +761,7 @@ void HorrorAIAssistantEditorPlugin::_refresh_activity_view() {
 			if (String(entry.get("kind", "")) != "edit") {
 				continue;
 			}
-			String action = entry.get("applied", false) ? String::utf8("ファイルを編集しました") : String::utf8("ファイルの変更案を作成しました");
+			String action = entry.get("discarded", false) ? String::utf8("変更案を破棄しました") : (entry.get("applied", false) ? String::utf8("ファイルを編集しました") : String::utf8("ファイルの変更案を作成しました"));
 			details += String(entry.get("exists", false) ? "\n  ~ " : "\n  + ") + action + ": " + String(entry.get("path", "")) + "\n";
 			String reason = entry.get("reason", "");
 			if (!reason.is_empty()) {
@@ -772,6 +781,22 @@ void HorrorAIAssistantEditorPlugin::_toggle_activity_details() {
 		return;
 	}
 	activity_details->set_visible(!activity_details->is_visible());
+	_refresh_activity_view();
+}
+
+void HorrorAIAssistantEditorPlugin::_discard_staged_changes() {
+	if (staged_files.is_empty()) {
+		return;
+	}
+	Array paths = staged_files.keys();
+	for (int i = 0; i < activity_entries.size(); i++) {
+		Dictionary entry = activity_entries[i];
+		if (String(entry.get("kind", "")) == "edit" && paths.has(entry.get("path", "")) && !bool(entry.get("applied", false))) {
+			entry["discarded"] = true;
+			activity_entries[i] = entry;
+		}
+	}
+	staged_files.clear();
 	_refresh_activity_view();
 }
 
@@ -803,7 +828,7 @@ Array HorrorAIAssistantEditorPlugin::_get_tool_schemas() const {
 	required.push_back("path");
 	required.push_back("content");
 	required.push_back("reason");
-	tools.push_back(_function_tool("stage_project_file", "ファイル全体の変更案をステージします。実際の書き込みはユーザーが一覧を確認してから行われます。既存ファイルは先にread_project_fileで読んでください。", properties, required));
+	tools.push_back(_function_tool("stage_project_file", "ファイル全体の変更案を作成します。AIの回答完了後に自動適用されます。既存ファイルは先にread_project_fileで読んでください。", properties, required));
 	return tools;
 }
 
@@ -980,12 +1005,11 @@ Dictionary HorrorAIAssistantEditorPlugin::_stage_project_file(const String &p_pa
 	entry["content"] = p_content;
 	entry["reason"] = p_reason;
 	staged_files[p_path] = entry;
-	_update_pending_changes();
 	result["ok"] = true;
 	result["path"] = p_path;
 	result["reason"] = p_reason;
 	result["characters"] = p_content.length();
-	result["message"] = "Change staged for user review; it has not been written yet.";
+	result["message"] = "Change staged; it will be applied after the complete response.";
 	return result;
 }
 
@@ -1067,39 +1091,6 @@ bool HorrorAIAssistantEditorPlugin::_is_ignored_project_path(const String &p_pat
 	return lower.ends_with(".pem") || lower.ends_with(".key") || lower.ends_with(".p12") || lower.ends_with(".pfx") || lower.ends_with(".env") || lower.ends_with(".keystore");
 }
 
-void HorrorAIAssistantEditorPlugin::_update_pending_changes() {
-	if (!apply_button) {
-		return;
-	}
-	apply_button->set_visible(!staged_files.is_empty());
-	apply_button->set_text(vformat(String::utf8("変更案を確認して適用 (%dファイル)"), staged_files.size()));
-}
-
-void HorrorAIAssistantEditorPlugin::_confirm_apply_changes() {
-	if (staged_files.is_empty()) {
-		return;
-	}
-	String summary = String::utf8("AIが提案したファイル内容です。確認してから適用してください。既存ファイルはバックアップされます。\n");
-	Array paths = staged_files.keys();
-	paths.sort();
-	for (int i = 0; i < paths.size(); i++) {
-		String path = paths[i];
-		Dictionary entry = staged_files[path];
-		summary += String(entry.get("exists", false) ? "• 更新: " : "• 作成: ") + path + "\n";
-		String reason = entry.get("reason", "");
-		if (!reason.is_empty()) {
-			summary += "  " + reason + "\n";
-		}
-		summary += "\n";
-		if (bool(entry.get("exists", false))) {
-			summary += String::utf8("--- 変更前 ---\n") + String(entry.get("original", "")) + "\n";
-		}
-		summary += String::utf8("--- 変更後 ---\n") + String(entry.get("content", "")) + "\n\n";
-	}
-	change_preview->set_text(summary);
-	EditorInterface::get_singleton()->popup_dialog_centered(apply_dialog, Size2i(620, 440));
-}
-
 void HorrorAIAssistantEditorPlugin::_apply_changes() {
 	if (staged_files.is_empty()) {
 		return;
@@ -1112,14 +1103,16 @@ void HorrorAIAssistantEditorPlugin::_apply_changes() {
 		Dictionary entry = staged_files[path];
 		bool file_exists = FileAccess::exists(path);
 		if (file_exists != bool(entry.get("exists", false)) || (!file_exists && DirAccess::dir_exists_absolute(ProjectSettings::get_singleton()->globalize_path(path)))) {
-			status_label->set_text(vformat(String::utf8("変更案を作成した後にファイル状態が変わりました。再度AIに依頼してください: %s"), path));
+			_set_busy(false, vformat(String::utf8("変更前にファイル状態が変わりました。安全のため未適用の案を破棄しました: %s"), path));
+			_discard_staged_changes();
 			return;
 		}
 		if (file_exists) {
 			Error read_error = OK;
 			Ref<FileAccess> current_file = FileAccess::open(path, FileAccess::READ, &read_error);
 			if (current_file.is_null() || current_file->get_length() > 524288 || current_file->get_as_text() != String(entry.get("original", ""))) {
-				status_label->set_text(vformat(String::utf8("変更案を作成した後にファイル内容が変わりました。再度AIに依頼してください: %s"), path));
+				_set_busy(false, vformat(String::utf8("変更前にファイル内容が変わりました。安全のため未適用の案を破棄しました: %s"), path));
+				_discard_staged_changes();
 				return;
 			}
 		}
@@ -1127,7 +1120,8 @@ void HorrorAIAssistantEditorPlugin::_apply_changes() {
 			continue;
 		}
 		if (unsaved_scenes.has(path) || unsaved_scenes.has(ProjectSettings::get_singleton()->globalize_path(path))) {
-			status_label->set_text(String::utf8("未保存のシーンを含む変更案です。先にシーンを保存してから、もう一度適用してください。"));
+			_set_busy(false, String::utf8("未保存のシーンがあるため適用できません。シーンを保存してから再度依頼してください。"));
+			_discard_staged_changes();
 			return;
 		}
 	}
@@ -1135,7 +1129,8 @@ void HorrorAIAssistantEditorPlugin::_apply_changes() {
 	String backup_root = OS::get_singleton()->get_user_data_dir().path_join("mina_ai_backups").path_join(String::num_uint64(OS::get_singleton()->get_ticks_msec()));
 	Error error = DirAccess::make_dir_recursive_absolute(backup_root);
 	if (error != OK) {
-		status_label->set_text(vformat(String::utf8("バックアップ用フォルダーを作れませんでした (%d)。"), error));
+		_set_busy(false, vformat(String::utf8("バックアップ用フォルダーを作れませんでした (%d)。未適用の案を破棄しました。"), error));
+		_discard_staged_changes();
 		return;
 	}
 
@@ -1148,12 +1143,14 @@ void HorrorAIAssistantEditorPlugin::_apply_changes() {
 		String backup_path = backup_root.path_join(path.trim_prefix("res://"));
 		error = DirAccess::make_dir_recursive_absolute(backup_path.get_base_dir());
 		if (error != OK) {
-			status_label->set_text(vformat(String::utf8("バックアップ先を作れませんでした: %s"), backup_path));
+			_set_busy(false, vformat(String::utf8("バックアップ先を作れませんでした。未適用の案を破棄しました: %s"), backup_path));
+			_discard_staged_changes();
 			return;
 		}
 		Ref<FileAccess> backup = FileAccess::open(backup_path, FileAccess::WRITE, &error);
 		if (backup.is_null() || !backup->store_string(entry.get("original", ""))) {
-			status_label->set_text(vformat(String::utf8("既存ファイルのバックアップに失敗しました: %s"), path));
+			_set_busy(false, vformat(String::utf8("既存ファイルのバックアップに失敗しました。未適用の案を破棄しました: %s"), path));
+			_discard_staged_changes();
 			return;
 		}
 	}
@@ -1186,7 +1183,8 @@ void HorrorAIAssistantEditorPlugin::_apply_changes() {
 				DirAccess::remove_absolute(ProjectSettings::get_singleton()->globalize_path(path));
 			}
 		}
-		status_label->set_text(vformat(String::utf8("ファイル適用に失敗したため、元の内容へ戻しました。エラー: %d"), error));
+		_set_busy(false, vformat(String::utf8("適用に失敗したため元の内容へ戻しました。未適用の案を破棄しました。エラー: %d"), error));
+		_discard_staged_changes();
 		return;
 	}
 
@@ -1212,9 +1210,8 @@ void HorrorAIAssistantEditorPlugin::_apply_changes() {
 		}
 	}
 	staged_files.clear();
-	_update_pending_changes();
 	_refresh_activity_view();
-	status_label->set_text(vformat(String::utf8("%dファイルを適用しました。バックアップ: %s"), changed_count, backup_root));
+	status_label->set_visible(false);
 	_append_message("assistant", vformat(String::utf8("変更を適用しました。バックアップは `%s` に保存しました。"), backup_root));
 }
 
