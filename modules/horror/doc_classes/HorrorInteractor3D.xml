@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="HorrorInteractor3D" inherits="RayCast3D" api_type="core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		Finds and activates objects in front of the player.
+	</brief_description>
+	<description>
+		[HorrorInteractor3D] casts a ray along its local negative Z axis and looks for a [HorrorInteractable3D] on the collider or one of its parents. It emits [signal target_changed] when the target or its prompt changes, then calls [method HorrorInteractable3D.interact] when the configured input action is pressed.
+		When an empty project is first opened in the Mina Engine editor, the [code]interact[/code] action is mapped to the physical [code]E[/code] key. Existing projects can add the action in Project Settings or change [member interaction_action].
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="get_interaction_action" qualifiers="const">
+			<return type="StringName" />
+			<description>
+				Returns the Input Map action used to activate the current target.
+			</description>
+		</method>
+		<method name="get_interaction_distance" qualifiers="const">
+			<return type="float" />
+			<description>
+				Returns the length of the interaction ray in meters.
+			</description>
+		</method>
+		<method name="get_current_prompt" qualifiers="const">
+			<return type="String" />
+			<description>
+				Returns the current target's prompt, or an empty string if no prompt is provided.
+			</description>
+		</method>
+		<method name="get_current_target" qualifiers="const">
+			<return type="Node" />
+			<description>
+				Returns the current interactable target, or [code]null[/code] if there is none.
+			</description>
+		</method>
+		<method name="interact">
+			<return type="bool" />
+			<description>
+				Calls [code]interact(self)[/code] on the current target and returns [code]true[/code] if it was called.
+			</description>
+		</method>
+		<method name="set_interaction_action">
+			<return type="void" />
+			<param index="0" name="action" type="StringName" />
+			<description>
+				Sets the Input Map action used to activate the current target. An empty name disables automatic input handling.
+			</description>
+		</method>
+		<method name="set_interaction_distance">
+			<return type="void" />
+			<param index="0" name="distance" type="float" />
+			<description>
+				Sets the length of the interaction ray in meters. Values below 0.05 are clamped to 0.05.
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="interaction_action" type="StringName" setter="set_interaction_action" getter="get_interaction_action" default="&amp;&quot;interact&quot;">
+			The Input Map action that activates the current target. Set this to an empty name to disable automatic input handling.
+		</member>
+		<member name="interaction_distance" type="float" setter="set_interaction_distance" getter="get_interaction_distance" default="2.0">
+			The ray length in meters. Values below 0.05 are clamped to 0.05.
+		</member>
+	</members>
+	<signals>
+		<signal name="target_changed">
+			<param index="0" name="target" type="Object" />
+			<param index="1" name="prompt" type="String" />
+			<description>
+				Emitted when the current target or its prompt changes.
+			</description>
+		</signal>
+	</signals>
+</class>

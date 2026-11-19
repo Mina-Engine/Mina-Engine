@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="HorrorInteractable3D" inherits="Node3D" api_type="core" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../../../doc/class.xsd">
+	<brief_description>
+		An object that can be focused and activated by [HorrorInteractor3D].
+	</brief_description>
+	<description>
+		Place a [HorrorInteractable3D] above a [CollisionObject3D] in the scene tree, then connect [signal interacted] to the object's response. The collision object may be a child or another descendant.
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="set_interaction_enabled">
+			<return type="void" />
+			<param index="0" name="enabled" type="bool" />
+			<description>
+				Sets whether this object can be focused and activated.
+			</description>
+		</method>
+		<method name="set_interaction_prompt">
+			<return type="void" />
+			<param index="0" name="prompt" type="String" />
+			<description>
+				Sets the text [HorrorInteractor3D] sends with its [signal HorrorInteractor3D.target_changed] signal.
+			</description>
+		</method>
+		<method name="get_interaction_prompt" qualifiers="const">
+			<return type="String" />
+			<description>
+				Returns the text [HorrorInteractor3D] sends with its [signal HorrorInteractor3D.target_changed] signal.
+			</description>
+		</method>
+		<method name="interact">
+			<return type="void" />
+			<param index="0" name="interactor" type="Object" />
+			<description>
+				Emits [signal interacted] when interaction is enabled.
+			</description>
+		</method>
+		<method name="is_interaction_enabled" qualifiers="const">
+			<return type="bool" />
+			<description>
+				Returns whether the object can currently be focused and activated.
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="interaction_enabled" type="bool" setter="set_interaction_enabled" getter="is_interaction_enabled" default="true">
+			If [code]false[/code], [HorrorInteractor3D] skips this object.
+		</member>
+		<member name="interaction_prompt" type="String" setter="set_interaction_prompt" getter="get_interaction_prompt" default="&quot;Interact&quot;">
+			Text for the interaction prompt.
+		</member>
+	</members>
+	<signals>
+		<signal name="interacted">
+			<param index="0" name="interactor" type="Node3D" />
+			<description>
+				Emitted when [method interact] is called while interaction is enabled.
+			</description>
+		</signal>
+	</signals>
+</class>
