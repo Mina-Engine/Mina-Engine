@@ -177,7 +177,7 @@ void HorrorAIAssistantEditorPlugin::_build_settings_window() {
 	margin->add_child(layout);
 
 	Label *description = memnew(Label);
-	description->set_text(String::utf8("Azure OpenAIのリソースとデプロイ名を入力します。APIキーはこの編集セッション中だけ保持します。"));
+	description->set_text(String::utf8("Azure OpenAIのEndpointとデプロイ名を入力します。API version に latest を指定するとOpenAI v1を使います。APIキーはこの編集セッション中だけ保持します。"));
 	description->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
 	layout->add_child(description);
 
@@ -200,7 +200,7 @@ void HorrorAIAssistantEditorPlugin::_build_settings_window() {
 
 	endpoint_input = add_setting_row(String::utf8("Endpoint"), "https://<resource>.openai.azure.com", false);
 	deployment_input = add_setting_row(String::utf8("Deployment"), "deployment-name", false);
-	api_version_input = add_setting_row(String::utf8("API version"), "2024-10-21", false);
+	api_version_input = add_setting_row(String::utf8("API version"), String::utf8("2024-10-21 / latest (OpenAI v1)"), false);
 	api_key_input = add_setting_row(String::utf8("API key"), String::utf8("AZURE_OPENAI_API_KEYでも設定できます"), true);
 
 	HBoxContainer *buttons = memnew(HBoxContainer);
@@ -325,11 +325,22 @@ void HorrorAIAssistantEditorPlugin::_request_next_turn() {
 		_set_busy(false, String::utf8("DeploymentとAPI versionを設定してください。"));
 		return;
 	}
-	String url = endpoint + "/openai/deployments/" + deployment.uri_encode() + "/chat/completions?api-version=" + api_version.uri_encode();
+	String endpoint_lower = endpoint.to_lower();
+	bool use_v1 = api_version.to_lower() == "latest" || endpoint_lower.ends_with("/openai/v1") || endpoint_lower.contains(".services.ai.azure.com");
+	String url;
+	if (use_v1) {
+		url = endpoint_lower.ends_with("/openai/v1") ? endpoint + "/chat/completions" : endpoint + "/openai/v1/chat/completions";
+	} else {
+		url = endpoint + "/openai/deployments/" + deployment.uri_encode() + "/chat/completions?api-version=" + api_version.uri_encode();
+	}
+	last_request_url = url;
 	Dictionary request_body;
 	request_body["messages"] = messages;
 	request_body["tools"] = _get_tool_schemas();
 	request_body["tool_choice"] = "auto";
+	if (use_v1) {
+		request_body["model"] = deployment;
+	}
 	Vector<String> headers;
 	headers.push_back("Content-Type: application/json");
 	headers.push_back("api-key: " + api_key);
@@ -348,15 +359,30 @@ void HorrorAIAssistantEditorPlugin::_on_request_completed(int p_result, int p_re
 	Error parse_error = parser.parse(response_text);
 	if (p_result != HTTPRequest::RESULT_SUCCESS || p_response_code < 200 || p_response_code >= 300) {
 		String error_text;
+		String error_code;
 		if (parse_error == OK && parser.get_data().get_type() == Variant::DICTIONARY) {
 			Dictionary response = parser.get_data();
 			Dictionary error = response.get("error", Dictionary());
 			error_text = error.get("message", "");
+			error_code = error.get("code", "");
 		}
 		if (error_text.is_empty()) {
 			error_text = vformat("HTTP %d (result %d)", p_response_code, p_result);
 		}
-		_set_busy(false, String::utf8("Azure OpenAIエラー: ") + error_text);
+		String status = String::utf8("Azure OpenAIエラー");
+		if (p_response_code > 0) {
+			status += vformat(" (HTTP %d", p_response_code);
+			if (!error_code.is_empty()) {
+				status += ", " + error_code;
+			}
+			status += ")";
+		}
+		status += ": " + error_text;
+		if (p_response_code == 404) {
+			status += String::utf8("\n要求URL: ") + last_request_url;
+			status += String::utf8("\nEndpointがAzureリソースのURLか、DeploymentがAzure上のデプロイ名と完全一致するか確認してください。Azure OpenAI v1を使う場合はAPI versionに latest を指定できます。");
+		}
+		_set_busy(false, status);
 		return;
 	}
 	if (parse_error != OK || parser.get_data().get_type() != Variant::DICTIONARY) {

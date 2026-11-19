@@ -48,6 +48,7 @@ class HorrorAIAssistantEditorPlugin : public EditorPlugin {
 	Array messages;
 	Dictionary staged_files;
 	String api_key;
+	String last_request_url;
 	int tool_round = 0;
 	bool busy = false;
 
