@@ -20,6 +20,7 @@
 #include "editor/docks/editor_dock.h"
 #include "editor/docks/editor_dock_manager.h"
 #include "editor/editor_interface.h"
+#include "editor/file_system/editor_paths.h"
 #include "editor/file_system/editor_file_system.h"
 #include "editor/settings/editor_settings.h"
 #include "editor/themes/editor_scale.h"
@@ -34,6 +35,11 @@
 #include "scene/gui/separator.h"
 #include "scene/gui/text_edit.h"
 #include "scene/main/http_request.h"
+
+#ifdef WINDOWS_ENABLED
+#include <windows.h>
+#include <wincrypt.h>
+#endif
 
 namespace {
 
@@ -62,9 +68,52 @@ Dictionary _function_tool(const String &p_name, const String &p_description, con
 	return tool;
 }
 
+String _get_saved_settings_path() {
+	EditorPaths *paths = EditorPaths::get_singleton();
+	return (paths ? paths->get_config_dir() : OS::get_singleton()->get_user_data_dir()).path_join("mina_ai_settings.cfg");
+}
+
+String _encrypt_api_key(const String &p_api_key) {
+#ifdef WINDOWS_ENABLED
+	CharString key_utf8 = p_api_key.utf8();
+	DATA_BLOB input = { (DWORD)key_utf8.length(), (BYTE *)key_utf8.get_data() };
+	DATA_BLOB encrypted = {};
+	if (!CryptProtectData(&input, L"Mina Engine Azure OpenAI API key", nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &encrypted)) {
+		return String();
+	}
+	String result = String::hex_encode_buffer(encrypted.pbData, encrypted.cbData);
+	LocalFree(encrypted.pbData);
+	return result;
+#else
+	// shortcut: other platforms must provide the key through the environment variable.
+	return String();
+#endif
+}
+
+String _decrypt_api_key(const String &p_encrypted_key) {
+#ifdef WINDOWS_ENABLED
+	Vector<uint8_t> encrypted_data = p_encrypted_key.hex_decode();
+	if (encrypted_data.is_empty()) {
+		return String();
+	}
+	DATA_BLOB input = { (DWORD)encrypted_data.size(), encrypted_data.ptrw() };
+	DATA_BLOB decrypted = {};
+	if (!CryptUnprotectData(&input, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &decrypted)) {
+		return String();
+	}
+	String result = String::utf8((const char *)decrypted.pbData, decrypted.cbData);
+	SecureZeroMemory(decrypted.pbData, decrypted.cbData);
+	LocalFree(decrypted.pbData);
+	return result;
+#else
+	return String();
+#endif
+}
+
 } // namespace
 
 void HorrorAIAssistantEditorPlugin::_build_panel() {
+	_load_settings();
 	dock = memnew(EditorDock);
 	dock->set_name("MinaAIAssistantDock");
 	dock->set_title(String::utf8("Mina AI"));
@@ -177,7 +226,11 @@ void HorrorAIAssistantEditorPlugin::_build_settings_window() {
 	margin->add_child(layout);
 
 	Label *description = memnew(Label);
-	description->set_text(String::utf8("Azure OpenAIのEndpointとデプロイ名を入力します。API version に latest を指定するとOpenAI v1を使います。APIキーはこの編集セッション中だけ保持します。"));
+#ifdef WINDOWS_ENABLED
+	description->set_text(String::utf8("Azure OpenAIのEndpointとデプロイ名を入力します。API version に latest を指定するとOpenAI v1を使います。APIキーはWindowsユーザーアカウントで暗号化して保存します。"));
+#else
+	description->set_text(String::utf8("Azure OpenAIのEndpointとデプロイ名を入力します。API version に latest を指定するとOpenAI v1を使います。APIキーは AZURE_OPENAI_API_KEY 環境変数で設定してください。"));
+#endif
 	description->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
 	layout->add_child(description);
 
@@ -216,6 +269,32 @@ void HorrorAIAssistantEditorPlugin::_build_settings_window() {
 	layout->add_child(buttons);
 }
 
+void HorrorAIAssistantEditorPlugin::_load_settings() {
+	saved_settings.instantiate();
+	Error load_error = saved_settings->load(_get_saved_settings_path());
+	bool migrated = false;
+	EditorSettings *editor_settings = EditorSettings::get_singleton();
+	static const char *setting_names[] = { "azure_endpoint", "azure_deployment", "azure_api_version" };
+	for (int i = 0; i < 3; i++) {
+		String key = setting_names[i];
+		String setting_name = "mina/ai/" + key;
+		if (!saved_settings->has_section_key("mina/ai", key) && editor_settings && editor_settings->has_setting(setting_name)) {
+			saved_settings->set_value("mina/ai", key, editor_settings->get_setting(setting_name));
+			migrated = true;
+		}
+	}
+	if (migrated || load_error == ERR_FILE_NOT_FOUND) {
+		Error save_error = saved_settings->save(_get_saved_settings_path());
+		if (save_error != OK) {
+			WARN_PRINT(vformat("Could not save Mina AI settings (error %d).", save_error));
+		}
+	}
+	api_key = _decrypt_api_key(saved_settings->get_value("mina/ai", "azure_api_key_dpapi", ""));
+	if (api_key.is_empty()) {
+		api_key = OS::get_singleton()->get_environment("AZURE_OPENAI_API_KEY");
+	}
+}
+
 void HorrorAIAssistantEditorPlugin::_start_new_session() {
 	if (!staged_files.is_empty()) {
 		status_label->set_text(String::utf8("先に未適用の変更案を確認してください。"));
@@ -251,11 +330,13 @@ void HorrorAIAssistantEditorPlugin::_append_message(const String &p_role, const 
 }
 
 String HorrorAIAssistantEditorPlugin::_get_setting(const String &p_name, const String &p_default) const {
-	EditorSettings *settings = EditorSettings::get_singleton();
-	if (!settings || !settings->has_setting(p_name)) {
+	if (saved_settings.is_null()) {
 		return p_default;
 	}
-	return settings->get_setting(p_name);
+	int separator = p_name.rfind("/");
+	String section = separator >= 0 ? p_name.substr(0, separator) : String();
+	String key = separator >= 0 ? p_name.substr(separator + 1) : p_name;
+	return saved_settings->get_value(section, key, p_default);
 }
 
 void HorrorAIAssistantEditorPlugin::_show_settings() {
@@ -270,14 +351,29 @@ void HorrorAIAssistantEditorPlugin::_show_settings() {
 }
 
 void HorrorAIAssistantEditorPlugin::_save_settings() {
-	EditorSettings *settings = EditorSettings::get_singleton();
-	settings->set_setting("mina/ai/azure_endpoint", endpoint_input->get_text().strip_edges());
-	settings->set_setting("mina/ai/azure_deployment", deployment_input->get_text().strip_edges());
-	settings->set_setting("mina/ai/azure_api_version", api_version_input->get_text().strip_edges());
-	EditorSettings::save();
+	saved_settings->set_value("mina/ai", "azure_endpoint", endpoint_input->get_text().strip_edges());
+	saved_settings->set_value("mina/ai", "azure_deployment", deployment_input->get_text().strip_edges());
+	saved_settings->set_value("mina/ai", "azure_api_version", api_version_input->get_text().strip_edges());
 	api_key = api_key_input->get_text().strip_edges();
 	if (api_key.is_empty()) {
 		api_key = OS::get_singleton()->get_environment("AZURE_OPENAI_API_KEY");
+	}
+	if (!api_key.is_empty()) {
+		String encrypted_key = _encrypt_api_key(api_key);
+#ifdef WINDOWS_ENABLED
+		if (encrypted_key.is_empty()) {
+			status_label->set_text(String::utf8("APIキーをWindowsで暗号化して保存できませんでした。環境変数 AZURE_OPENAI_API_KEY を使ってください。"));
+			return;
+		}
+		saved_settings->set_value("mina/ai", "azure_api_key_dpapi", encrypted_key);
+#endif
+	} else {
+		saved_settings->set_value("mina/ai", "azure_api_key_dpapi", "");
+	}
+	Error save_error = saved_settings->save(_get_saved_settings_path());
+	if (save_error != OK) {
+		status_label->set_text(vformat(String::utf8("設定を保存できませんでした (%d)。"), save_error));
+		return;
 	}
 	settings_window->hide();
 	status_label->set_text(api_key.is_empty() ? String::utf8("APIキーを入力するか AZURE_OPENAI_API_KEY を設定してください。") : String::utf8("Azure OpenAIの設定を保存しました。"));

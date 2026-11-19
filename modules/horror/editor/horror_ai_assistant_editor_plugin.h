@@ -12,6 +12,7 @@
 
 #include "editor/plugins/editor_plugin.h"
 
+#include "core/io/config_file.h"
 #include "core/variant/array.h"
 #include "core/variant/dictionary.h"
 
@@ -49,11 +50,13 @@ class HorrorAIAssistantEditorPlugin : public EditorPlugin {
 	Dictionary staged_files;
 	String api_key;
 	String last_request_url;
+	Ref<ConfigFile> saved_settings;
 	int tool_round = 0;
 	bool busy = false;
 
 	void _build_panel();
 	void _build_settings_window();
+	void _load_settings();
 	void _start_new_session();
 	void _append_message(const String &p_role, const String &p_text);
 	void _send_prompt();
