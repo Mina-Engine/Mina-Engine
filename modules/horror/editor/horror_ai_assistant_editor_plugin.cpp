@@ -151,6 +151,18 @@ void HorrorAIAssistantEditorPlugin::_build_panel() {
 	transcript->set_custom_minimum_size(Size2(0, 220) * EDSCALE);
 	scroll->add_child(transcript);
 
+	activity_button = memnew(Button);
+	activity_button->set_text(String::utf8("作業内容を表示"));
+	activity_button->set_visible(false);
+	activity_button->connect(SceneStringName(pressed), callable_mp(this, &HorrorAIAssistantEditorPlugin::_toggle_activity_details));
+	layout->add_child(activity_button);
+	activity_details = memnew(TextEdit);
+	activity_details->set_editable(false);
+	activity_details->set_line_wrapping_mode(TextEdit::LINE_WRAPPING_BOUNDARY);
+	activity_details->set_custom_minimum_size(Size2(0, 150) * EDSCALE);
+	activity_details->set_visible(false);
+	layout->add_child(activity_details);
+
 	apply_button = memnew(Button);
 	apply_button->set_text(String::utf8("AIの変更案を確認"));
 	apply_button->set_visible(false);
@@ -297,6 +309,14 @@ void HorrorAIAssistantEditorPlugin::_start_new_session() {
 		return;
 	}
 	responses_input_items.clear();
+	activity_entries.clear();
+	if (activity_button) {
+		activity_button->set_visible(false);
+	}
+	if (activity_details) {
+		activity_details->clear();
+		activity_details->set_visible(false);
+	}
 	system_instructions = String::utf8(
 			"あなたは Mina Engine に組み込まれたゲーム制作エージェントです。Godot 4.7.2 のプロジェクトを調査し、ユーザーの指示に沿ってシーン、GDScript、音響の配置、演出イベントをまとめて制作します。日本語で応答してください。\n"
 			"必ず利用可能なツールでプロジェクト構成と対象ファイルを調べてから編集案を作ってください。音声などのバイナリアセットを捏造せず、既存音声一覧から選んでください。必要な場合は .tscn と .gd を一緒に作成し、イベントのタイミングや音の再生、照明変化はスクリプトで実装してください。\n"
@@ -503,7 +523,9 @@ void HorrorAIAssistantEditorPlugin::_handle_responses_response(const Dictionary 
 			Dictionary result;
 			if (arguments_parser.parse(arguments_text) == OK && arguments_parser.get_data().get_type() == Variant::DICTIONARY) {
 				arguments = arguments_parser.get_data();
-				result = _execute_tool(call.get("name", ""), arguments);
+				String tool_name = call.get("name", "");
+				result = _execute_tool(tool_name, arguments);
+				_record_tool_activity(tool_name, arguments, result);
 			} else {
 				result["ok"] = false;
 				result["error"] = "Function arguments were not a JSON object.";
@@ -552,6 +574,108 @@ void HorrorAIAssistantEditorPlugin::_set_busy(bool p_busy, const String &p_statu
 	if (status_label && !p_status.is_empty()) {
 		status_label->set_text(p_status);
 	}
+}
+
+void HorrorAIAssistantEditorPlugin::_record_tool_activity(const String &p_name, const Dictionary &p_arguments, const Dictionary &p_result) {
+	bool ok = p_result.get("ok", false);
+	String path = p_result.get("path", p_arguments.get("path", ""));
+	String summary;
+	if (!ok) {
+		summary = String::utf8("失敗: ") + String(p_result.get("error", "不明なエラー"));
+	} else if (p_name == "list_project_files" || p_name == "list_audio_files") {
+		Array files = p_result.get("files", Array());
+		summary = vformat(String::utf8("%sを一覧しました（%d件）: %s"), p_name == "list_audio_files" ? String::utf8("音声ファイル") : String::utf8("プロジェクトファイル"), files.size(), p_result.get("root", "res://"));
+	} else if (p_name == "read_project_file") {
+		summary = vformat(String::utf8("ファイルを読み込みました: %s"), path);
+	} else if (p_name == "inspect_current_scene") {
+		Array nodes = p_result.get("nodes", Array());
+		summary = vformat(String::utf8("現在のシーンを確認しました（ノード %d個）: %s"), nodes.size(), p_result.get("scene_path", ""));
+	} else if (p_name == "stage_project_file") {
+		summary = vformat(String::utf8("ファイルの変更案を作成しました: %s"), path);
+	} else {
+		summary = vformat(String::utf8("ツールを実行しました: %s"), p_name);
+	}
+
+	Dictionary entry;
+	entry["kind"] = p_name == "stage_project_file" && ok ? "edit" : "operation";
+	entry["summary"] = summary;
+	entry["path"] = path;
+	entry["ok"] = ok;
+	if (p_name == "stage_project_file" && ok && staged_files.has(path)) {
+		Dictionary staged = staged_files[path];
+		entry["exists"] = staged.get("exists", false);
+		entry["original"] = staged.get("original", "");
+		entry["content"] = staged.get("content", "");
+		entry["reason"] = staged.get("reason", "");
+		entry["applied"] = false;
+		for (int i = 0; i < activity_entries.size(); i++) {
+			Dictionary previous = activity_entries[i];
+			if (String(previous.get("kind", "")) == "edit" && String(previous.get("path", "")) == path) {
+				activity_entries[i] = entry;
+				_refresh_activity_view();
+				return;
+			}
+		}
+	}
+	activity_entries.push_back(entry);
+	_refresh_activity_view();
+}
+
+void HorrorAIAssistantEditorPlugin::_refresh_activity_view() {
+	if (!activity_button || !activity_details) {
+		return;
+	}
+	int edit_count = 0;
+	int operation_count = 0;
+	for (int i = 0; i < activity_entries.size(); i++) {
+		Dictionary entry = activity_entries[i];
+		if (String(entry.get("kind", "")) == "edit") {
+			edit_count++;
+		} else {
+			operation_count++;
+		}
+	}
+	activity_button->set_visible(!activity_entries.is_empty());
+	activity_button->set_text(vformat(String::utf8("作業ログを%s（編集 %d・調査 %d）"), activity_details->is_visible() ? String::utf8("隠す") : String::utf8("表示"), edit_count, operation_count));
+
+	String details = String::utf8("Mina AI の作業履歴\n\n調査・読み込み\n");
+	for (int i = 0; i < activity_entries.size(); i++) {
+		Dictionary entry = activity_entries[i];
+		if (String(entry.get("kind", "")) != "edit") {
+			details += String::utf8("  • ") + String(entry.get("summary", "")) + "\n";
+		}
+	}
+	if (operation_count == 0) {
+		details += String::utf8("  なし\n");
+	}
+	if (edit_count > 0) {
+		details += String::utf8("\nファイル変更履歴\n");
+		for (int i = 0; i < activity_entries.size(); i++) {
+			Dictionary entry = activity_entries[i];
+			if (String(entry.get("kind", "")) != "edit") {
+				continue;
+			}
+			String action = entry.get("applied", false) ? String::utf8("ファイルを編集しました") : String::utf8("ファイルの変更案を作成しました");
+			details += String(entry.get("exists", false) ? "\n  ~ " : "\n  + ") + action + ": " + String(entry.get("path", "")) + "\n";
+			String reason = entry.get("reason", "");
+			if (!reason.is_empty()) {
+				details += String::utf8("    ") + reason + "\n";
+			}
+			if (bool(entry.get("exists", false))) {
+				details += String::utf8("\n    --- 変更前 ---\n") + String(entry.get("original", "")) + "\n";
+			}
+			details += String::utf8("\n    +++ 変更後 ---\n") + String(entry.get("content", "")) + "\n";
+		}
+	}
+	activity_details->set_text(details);
+}
+
+void HorrorAIAssistantEditorPlugin::_toggle_activity_details() {
+	if (!activity_details) {
+		return;
+	}
+	activity_details->set_visible(!activity_details->is_visible());
+	_refresh_activity_view();
 }
 
 Array HorrorAIAssistantEditorPlugin::_get_tool_schemas() const {
@@ -982,8 +1106,17 @@ void HorrorAIAssistantEditorPlugin::_apply_changes() {
 		editor_interface->reload_scene_from_path(active_scene_path);
 	}
 	int changed_count = staged_files.size();
+	for (int i = 0; i < activity_entries.size(); i++) {
+		Dictionary entry = activity_entries[i];
+		if (String(entry.get("kind", "")) == "edit" && paths.has(entry.get("path", ""))) {
+			entry["applied"] = true;
+			entry["summary"] = vformat(String::utf8("ファイルを編集しました: %s"), entry.get("path", ""));
+			activity_entries[i] = entry;
+		}
+	}
 	staged_files.clear();
 	_update_pending_changes();
+	_refresh_activity_view();
 	status_label->set_text(vformat(String::utf8("%dファイルを適用しました。バックアップ: %s"), changed_count, backup_root));
 	_append_message("assistant", vformat(String::utf8("変更を適用しました。バックアップは `%s` に保存しました。"), backup_root));
 }

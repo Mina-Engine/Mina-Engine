@@ -38,14 +38,17 @@ class HorrorAIAssistantEditorPlugin : public EditorPlugin {
 	Label *session_title = nullptr;
 	Button *send_button = nullptr;
 	Button *apply_button = nullptr;
+	Button *activity_button = nullptr;
 	Window *settings_window = nullptr;
 	TextEdit *change_preview = nullptr;
+	TextEdit *activity_details = nullptr;
 	LineEdit *endpoint_input = nullptr;
 	LineEdit *deployment_input = nullptr;
 	LineEdit *api_key_input = nullptr;
 	ConfirmationDialog *apply_dialog = nullptr;
 
 	Array responses_input_items;
+	Array activity_entries;
 	String system_instructions;
 	Dictionary staged_files;
 	String api_key;
@@ -64,6 +67,9 @@ class HorrorAIAssistantEditorPlugin : public EditorPlugin {
 	void _on_request_completed(int p_result, int p_response_code, const PackedStringArray &p_headers, const PackedByteArray &p_body);
 	void _handle_responses_response(const Dictionary &p_response);
 	void _set_busy(bool p_busy, const String &p_status = String());
+	void _record_tool_activity(const String &p_name, const Dictionary &p_arguments, const Dictionary &p_result);
+	void _refresh_activity_view();
+	void _toggle_activity_details();
 	void _show_settings();
 	void _save_settings();
 	void _update_pending_changes();
