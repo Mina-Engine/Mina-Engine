@@ -42,19 +42,17 @@ class HorrorAIAssistantEditorPlugin : public EditorPlugin {
 	TextEdit *change_preview = nullptr;
 	LineEdit *endpoint_input = nullptr;
 	LineEdit *deployment_input = nullptr;
-	LineEdit *api_version_input = nullptr;
 	LineEdit *api_key_input = nullptr;
 	ConfirmationDialog *apply_dialog = nullptr;
 
-	Array messages;
 	Array responses_input_items;
+	String system_instructions;
 	Dictionary staged_files;
 	String api_key;
 	String last_request_url;
 	Ref<ConfigFile> saved_settings;
 	int tool_round = 0;
 	bool busy = false;
-	bool current_request_uses_responses_api = false;
 
 	void _build_panel();
 	void _build_settings_window();
@@ -73,7 +71,6 @@ class HorrorAIAssistantEditorPlugin : public EditorPlugin {
 	void _apply_changes();
 
 	Array _get_tool_schemas() const;
-	Array _get_responses_tool_schemas() const;
 	Dictionary _execute_tool(const String &p_name, const Dictionary &p_arguments);
 	Dictionary _list_project_files(const String &p_directory, bool p_audio_only) const;
 	void _collect_project_files(const String &p_directory, Array &r_files, int p_limit, bool p_audio_only, int &r_count) const;

@@ -57,14 +57,11 @@ Dictionary _function_tool(const String &p_name, const String &p_description, con
 	parameters["required"] = p_required;
 	parameters["additionalProperties"] = false;
 
-	Dictionary function;
-	function["name"] = p_name;
-	function["description"] = p_description;
-	function["parameters"] = parameters;
-
 	Dictionary tool;
 	tool["type"] = "function";
-	tool["function"] = function;
+	tool["name"] = p_name;
+	tool["description"] = p_description;
+	tool["parameters"] = parameters;
 	return tool;
 }
 
@@ -127,16 +124,16 @@ void HorrorAIAssistantEditorPlugin::_build_panel() {
 
 	HBoxContainer *header = memnew(HBoxContainer);
 	session_title = memnew(Label);
-	session_title->set_text("New Session");
+	session_title->set_text(String::utf8("新しいセッション"));
 	session_title->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 	header->add_child(session_title);
 	Button *new_session_button = memnew(Button);
-	new_session_button->set_text("+");
+	new_session_button->set_text(String::utf8("新規"));
 	new_session_button->set_tooltip_text(String::utf8("新しいセッション"));
 	new_session_button->connect(SceneStringName(pressed), callable_mp(this, &HorrorAIAssistantEditorPlugin::_start_new_session));
 	header->add_child(new_session_button);
 	Button *settings_button = memnew(Button);
-	settings_button->set_text("⚙");
+	settings_button->set_text(String::utf8("設定"));
 	settings_button->set_tooltip_text(String::utf8("Azure OpenAI設定"));
 	settings_button->connect(SceneStringName(pressed), callable_mp(this, &HorrorAIAssistantEditorPlugin::_show_settings));
 	header->add_child(settings_button);
@@ -227,9 +224,9 @@ void HorrorAIAssistantEditorPlugin::_build_settings_window() {
 
 	Label *description = memnew(Label);
 #ifdef WINDOWS_ENABLED
-	description->set_text(String::utf8("API version に latest を指定するかEndpointに /openai/v1 を含めると、推論モデル対応のResponses APIを使います。APIキーはWindowsユーザーアカウントで暗号化して保存します。"));
+	description->set_text(String::utf8("API versionは自動設定です。EndpointとDeploymentを入力してください。APIキーはWindowsユーザーアカウントで暗号化して保存します。"));
 #else
-	description->set_text(String::utf8("API version に latest を指定するかEndpointに /openai/v1 を含めると、推論モデル対応のResponses APIを使います。APIキーは AZURE_OPENAI_API_KEY 環境変数で設定してください。"));
+	description->set_text(String::utf8("API versionは自動設定です。EndpointとDeploymentを入力してください。APIキーは AZURE_OPENAI_API_KEY 環境変数で設定してください。"));
 #endif
 	description->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
 	layout->add_child(description);
@@ -253,7 +250,6 @@ void HorrorAIAssistantEditorPlugin::_build_settings_window() {
 
 	endpoint_input = add_setting_row(String::utf8("Endpoint"), "https://<resource>.openai.azure.com", false);
 	deployment_input = add_setting_row(String::utf8("Deployment"), "deployment-name", false);
-	api_version_input = add_setting_row(String::utf8("API version"), String::utf8("2024-10-21 / latest (Responses API)"), false);
 	api_key_input = add_setting_row(String::utf8("API key"), String::utf8("AZURE_OPENAI_API_KEYでも設定できます"), true);
 
 	HBoxContainer *buttons = memnew(HBoxContainer);
@@ -274,8 +270,8 @@ void HorrorAIAssistantEditorPlugin::_load_settings() {
 	Error load_error = saved_settings->load(_get_saved_settings_path());
 	bool migrated = false;
 	EditorSettings *editor_settings = EditorSettings::get_singleton();
-	static const char *setting_names[] = { "azure_endpoint", "azure_deployment", "azure_api_version" };
-	for (int i = 0; i < 3; i++) {
+	static const char *setting_names[] = { "azure_endpoint", "azure_deployment" };
+	for (int i = 0; i < 2; i++) {
 		String key = setting_names[i];
 		String setting_name = "mina/ai/" + key;
 		if (!saved_settings->has_section_key("mina/ai", key) && editor_settings && editor_settings->has_setting(setting_name)) {
@@ -300,22 +296,18 @@ void HorrorAIAssistantEditorPlugin::_start_new_session() {
 		status_label->set_text(String::utf8("先に未適用の変更案を確認してください。"));
 		return;
 	}
-	messages.clear();
 	responses_input_items.clear();
-	Dictionary system_message;
-	system_message["role"] = "system";
-	system_message["content"] = String::utf8(
+	system_instructions = String::utf8(
 			"あなたは Mina Engine に組み込まれたゲーム制作エージェントです。Godot 4.7.2 のプロジェクトを調査し、ユーザーの指示に沿ってシーン、GDScript、音響の配置、演出イベントをまとめて制作します。日本語で応答してください。\n"
 			"必ず利用可能なツールでプロジェクト構成と対象ファイルを調べてから編集案を作ってください。音声などのバイナリアセットを捏造せず、既存音声一覧から選んでください。必要な場合は .tscn と .gd を一緒に作成し、イベントのタイミングや音の再生、照明変化はスクリプトで実装してください。\n"
 			"ファイル変更は stage_project_file だけで提案してください。既存ファイルを読む前に置き換えないでください。すべてのパスは res:// 以下で、テキスト形式のファイルだけを扱います。変更案はユーザーが一括確認してから適用されます。"
 	);
-	messages.push_back(system_message);
 	if (transcript) {
 		transcript->clear();
 		transcript->add_text(String::utf8("Mina AI\n何を作りましょう？\n\n"));
 	}
 	if (session_title) {
-		session_title->set_text("New Session");
+		session_title->set_text(String::utf8("新しいセッション"));
 	}
 	if (status_label) {
 		status_label->set_text(String::utf8("Azure OpenAI 接続待ち"));
@@ -325,8 +317,13 @@ void HorrorAIAssistantEditorPlugin::_append_message(const String &p_role, const 
 	if (!transcript) {
 		return;
 	}
-	transcript->add_text(p_role == "user" ? String::utf8("あなた\n") : String::utf8("Mina AI\n"));
-	transcript->add_text(p_text + "\n\n");
+	String display_text = p_text;
+	int line_count = p_text.count("\n") + 1;
+	if (p_role == "user" && (p_text.length() > 1000 || line_count > 20)) {
+		display_text = vformat(String::utf8("長文を送信しました（%d行・%d文字）。全文はAIに送信済みです。"), line_count, p_text.length());
+	}
+	transcript->add_text("\n" + (p_role == "user" ? String::utf8("【あなた】") : String::utf8("【Mina AI】")) + "\n");
+	transcript->add_text(display_text + "\n\n");
 	transcript->scroll_to_line(transcript->get_line_count());
 }
 
@@ -343,7 +340,6 @@ String HorrorAIAssistantEditorPlugin::_get_setting(const String &p_name, const S
 void HorrorAIAssistantEditorPlugin::_show_settings() {
 	endpoint_input->set_text(_get_setting("mina/ai/azure_endpoint", ""));
 	deployment_input->set_text(_get_setting("mina/ai/azure_deployment", ""));
-	api_version_input->set_text(_get_setting("mina/ai/azure_api_version", "2024-10-21"));
 	if (api_key.is_empty()) {
 		api_key = OS::get_singleton()->get_environment("AZURE_OPENAI_API_KEY");
 	}
@@ -354,7 +350,6 @@ void HorrorAIAssistantEditorPlugin::_show_settings() {
 void HorrorAIAssistantEditorPlugin::_save_settings() {
 	saved_settings->set_value("mina/ai", "azure_endpoint", endpoint_input->get_text().strip_edges());
 	saved_settings->set_value("mina/ai", "azure_deployment", deployment_input->get_text().strip_edges());
-	saved_settings->set_value("mina/ai", "azure_api_version", api_version_input->get_text().strip_edges());
 	api_key = api_key_input->get_text().strip_edges();
 	if (api_key.is_empty()) {
 		api_key = OS::get_singleton()->get_environment("AZURE_OPENAI_API_KEY");
@@ -396,10 +391,6 @@ void HorrorAIAssistantEditorPlugin::_send_prompt() {
 		_show_settings();
 		return;
 	}
-	Dictionary user_message;
-	user_message["role"] = "user";
-	user_message["content"] = prompt;
-	messages.push_back(user_message);
 	Dictionary response_input_message;
 	response_input_message["type"] = "message";
 	response_input_message["role"] = "user";
@@ -422,42 +413,25 @@ void HorrorAIAssistantEditorPlugin::_request_next_turn() {
 		return;
 	}
 	String deployment = _get_setting("mina/ai/azure_deployment", "").strip_edges();
-	String api_version = _get_setting("mina/ai/azure_api_version", "2024-10-21").strip_edges();
-	if (deployment.is_empty() || api_version.is_empty()) {
-		_set_busy(false, String::utf8("DeploymentとAPI versionを設定してください。"));
+	if (deployment.is_empty()) {
+		_set_busy(false, String::utf8("Deploymentを設定してください。"));
 		return;
 	}
 	String endpoint_lower = endpoint.to_lower();
-	bool use_v1 = api_version.to_lower() == "latest" || endpoint_lower.ends_with("/openai/v1") || endpoint_lower.contains(".services.ai.azure.com");
-	String url;
-	if (use_v1) {
-		url = endpoint_lower.ends_with("/openai/v1") ? endpoint + "/responses" : endpoint + "/openai/v1/responses";
-	} else {
-		url = endpoint + "/openai/deployments/" + deployment.uri_encode() + "/chat/completions?api-version=" + api_version.uri_encode();
-	}
+	String url = endpoint_lower.ends_with("/openai/v1") ? endpoint + "/responses" : endpoint + "/openai/v1/responses";
 	last_request_url = url;
-	current_request_uses_responses_api = use_v1;
 	Dictionary request_body;
-	if (use_v1) {
-		request_body["model"] = deployment;
-		Dictionary system_message = messages[0];
-		request_body["instructions"] = system_message.get("content", "");
-		request_body["input"] = responses_input_items;
-		request_body["tools"] = _get_responses_tool_schemas();
-		request_body["tool_choice"] = "auto";
-	} else {
-		request_body["messages"] = messages;
-		request_body["tools"] = _get_tool_schemas();
-		request_body["tool_choice"] = "auto";
-	}
+	request_body["model"] = deployment;
+	request_body["instructions"] = system_instructions;
+	request_body["input"] = responses_input_items;
+	request_body["tools"] = _get_tool_schemas();
+	request_body["tool_choice"] = "auto";
 	Vector<String> headers;
 	headers.push_back("Content-Type: application/json");
 	headers.push_back("api-key: " + api_key);
 	Error error = http_request->request(url, headers, HTTPClient::METHOD_POST, JSON::stringify(request_body));
 	if (error != OK) {
-		if (use_v1) {
-			responses_input_items.clear();
-		}
+		responses_input_items.clear();
 		_set_busy(false, vformat(String::utf8("Azure OpenAIへのリクエストを開始できませんでした (%s)。"), error));
 	}
 }
@@ -492,11 +466,9 @@ void HorrorAIAssistantEditorPlugin::_on_request_completed(int p_result, int p_re
 		status += ": " + error_text;
 		if (p_response_code == 404) {
 			status += String::utf8("\n要求URL: ") + last_request_url;
-			status += String::utf8("\nEndpointがAzureリソースのURLか、DeploymentがAzure上のデプロイ名と完全一致するか確認してください。Azure OpenAI v1を使う場合はAPI versionに latest を指定できます。");
+			status += String::utf8("\nEndpointとDeploymentがAzure上の設定と一致するか確認してください。API versionはResponses APIが自動選択します。");
 		}
-		if (current_request_uses_responses_api) {
-			responses_input_items.clear();
-		}
+		responses_input_items.clear();
 		_set_busy(false, status);
 		return;
 	}
@@ -505,53 +477,7 @@ void HorrorAIAssistantEditorPlugin::_on_request_completed(int p_result, int p_re
 		return;
 	}
 	Dictionary response = parser.get_data();
-	if (current_request_uses_responses_api) {
-		_handle_responses_response(response);
-		return;
-	}
-	Array choices = response.get("choices", Array());
-	if (choices.is_empty()) {
-		_set_busy(false, String::utf8("Azure OpenAIから応答がありませんでした。"));
-		return;
-	}
-	Dictionary choice = choices[0];
-	Dictionary assistant_message = choice.get("message", Dictionary());
-	Array tool_calls = assistant_message.get("tool_calls", Array());
-	if (!tool_calls.is_empty()) {
-		messages.push_back(assistant_message);
-		for (int i = 0; i < tool_calls.size(); i++) {
-			Dictionary tool_call = tool_calls[i];
-			Dictionary function = tool_call.get("function", Dictionary());
-			String arguments_text = function.get("arguments", "{}");
-			JSON arguments_parser;
-			Dictionary arguments;
-			if (arguments_parser.parse(arguments_text) == OK && arguments_parser.get_data().get_type() == Variant::DICTIONARY) {
-				arguments = arguments_parser.get_data();
-			}
-			Dictionary result = _execute_tool(function.get("name", ""), arguments);
-			Dictionary tool_message;
-			tool_message["role"] = "tool";
-			tool_message["tool_call_id"] = tool_call.get("id", "");
-			tool_message["content"] = JSON::stringify(result);
-			messages.push_back(tool_message);
-		}
-		tool_round++;
-		if (tool_round > 6) {
-			_set_busy(false, String::utf8("ツール実行回数の上限に達しました。指示を分けて続けてください。"));
-			return;
-		}
-		_set_busy(true, String::utf8("プロジェクトを調査・編集しています…"));
-		_request_next_turn();
-		return;
-	}
-	String answer = assistant_message.get("content", "");
-	if (answer.is_empty()) {
-		answer = String::utf8("応答は返りましたが、本文が空でした。Deploymentのチャット対応を確認してください。 ");
-	}
-	messages.push_back(assistant_message);
-	_append_message("assistant", answer);
-	_set_busy(false, staged_files.is_empty() ? String::utf8("応答しました。") : String::utf8("変更案を確認して適用できます。"));
-	_update_pending_changes();
+	_handle_responses_response(response);
 }
 
 void HorrorAIAssistantEditorPlugin::_handle_responses_response(const Dictionary &p_response) {
@@ -613,10 +539,6 @@ void HorrorAIAssistantEditorPlugin::_handle_responses_response(const Dictionary 
 	if (answer.is_empty()) {
 		answer = String::utf8("応答は返りましたが、表示できる本文がありませんでした。");
 	}
-	Dictionary assistant_message;
-	assistant_message["role"] = "assistant";
-	assistant_message["content"] = answer;
-	messages.push_back(assistant_message);
 	_append_message("assistant", answer);
 	_set_busy(false, staged_files.is_empty() ? String::utf8("応答しました。") : String::utf8("変更案を確認して適用できます。"));
 	_update_pending_changes();
@@ -661,21 +583,6 @@ Array HorrorAIAssistantEditorPlugin::_get_tool_schemas() const {
 	required.push_back("content");
 	required.push_back("reason");
 	tools.push_back(_function_tool("stage_project_file", "ファイル全体の変更案をステージします。実際の書き込みはユーザーが一覧を確認してから行われます。既存ファイルは先にread_project_fileで読んでください。", properties, required));
-	return tools;
-}
-
-Array HorrorAIAssistantEditorPlugin::_get_responses_tool_schemas() const {
-	Array tools;
-	Array chat_tools = _get_tool_schemas();
-	for (int i = 0; i < chat_tools.size(); i++) {
-		Dictionary function = Dictionary(chat_tools[i]).get("function", Dictionary());
-		Dictionary tool;
-		tool["type"] = "function";
-		tool["name"] = function.get("name", "");
-		tool["description"] = function.get("description", "");
-		tool["parameters"] = function.get("parameters", Dictionary());
-		tools.push_back(tool);
-	}
 	return tools;
 }
 
@@ -901,10 +808,13 @@ void HorrorAIAssistantEditorPlugin::_collect_scene_nodes(Node *p_node, const Str
 }
 
 bool HorrorAIAssistantEditorPlugin::_is_safe_project_path(const String &p_path, bool p_allow_directory) const {
-	if (!p_path.begins_with("res://") || p_path.contains("\\") || p_path.contains(":")) {
+	if (!p_path.begins_with("res://") || p_path.contains("\\")) {
 		return false;
 	}
 	String relative = p_path.trim_prefix("res://");
+	if (relative.contains(":")) {
+		return false;
+	}
 	if (relative.is_empty()) {
 		return p_allow_directory;
 	}
