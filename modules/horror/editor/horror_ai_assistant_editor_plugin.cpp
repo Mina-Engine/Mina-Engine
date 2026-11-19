@@ -91,8 +91,21 @@ Dictionary _function_tool(const String &p_name, const String &p_description, con
 }
 
 String _get_saved_settings_path() {
-	EditorPaths *paths = EditorPaths::get_singleton();
-	return (paths ? paths->get_config_dir() : OS::get_singleton()->get_user_data_dir()).path_join("mina_ai_settings.cfg");
+	OS *os = OS::get_singleton();
+	String config_dir = os->get_config_path();
+	if (config_dir.is_empty()) {
+		config_dir = os->get_user_data_dir();
+	}
+	return config_dir.path_join("Mina Engine").path_join("mina_ai_settings.cfg");
+}
+
+Error _save_saved_settings(const Ref<ConfigFile> &p_settings) {
+	String path = _get_saved_settings_path();
+	Error dir_error = DirAccess::make_dir_recursive_absolute(path.get_base_dir());
+	if (dir_error != OK && dir_error != ERR_ALREADY_EXISTS) {
+		return dir_error;
+	}
+	return p_settings->save(path);
 }
 
 String _encrypt_api_key(const String &p_api_key) {
@@ -388,7 +401,23 @@ void HorrorAIAssistantEditorPlugin::_refresh_image_attachments() {
 
 void HorrorAIAssistantEditorPlugin::_load_settings() {
 	saved_settings.instantiate();
-	Error load_error = saved_settings->load(_get_saved_settings_path());
+	String settings_path = _get_saved_settings_path();
+	Error load_error = saved_settings->load(settings_path);
+	bool migrated_from_file = false;
+	if (load_error == ERR_FILE_NOT_FOUND) {
+		EditorPaths *paths = EditorPaths::get_singleton();
+		OS *os = OS::get_singleton();
+		String legacy_path = (paths ? paths->get_config_dir() : os->get_user_data_dir()).path_join("mina_ai_settings.cfg");
+		if (legacy_path != settings_path && FileAccess::exists(legacy_path)) {
+			load_error = saved_settings->load(legacy_path);
+			migrated_from_file = load_error == OK;
+		}
+		String previous_global_path = os->get_config_path().path_join(os->get_godot_dir_name()).path_join("mina_ai_settings.cfg");
+		if (load_error == ERR_FILE_NOT_FOUND && previous_global_path != settings_path && previous_global_path != legacy_path && FileAccess::exists(previous_global_path)) {
+			load_error = saved_settings->load(previous_global_path);
+			migrated_from_file = load_error == OK;
+		}
+	}
 	bool migrated = false;
 	EditorSettings *editor_settings = EditorSettings::get_singleton();
 	static const char *setting_names[] = { "azure_endpoint", "azure_deployment" };
@@ -400,8 +429,8 @@ void HorrorAIAssistantEditorPlugin::_load_settings() {
 			migrated = true;
 		}
 	}
-	if (migrated || load_error == ERR_FILE_NOT_FOUND) {
-		Error save_error = saved_settings->save(_get_saved_settings_path());
+	if (migrated_from_file || migrated || load_error == ERR_FILE_NOT_FOUND) {
+		Error save_error = _save_saved_settings(saved_settings);
 		if (save_error != OK) {
 			WARN_PRINT(vformat("Could not save Mina AI settings (error %d).", save_error));
 		}
@@ -596,14 +625,21 @@ void HorrorAIAssistantEditorPlugin::_show_settings() {
 }
 
 void HorrorAIAssistantEditorPlugin::_save_settings() {
-	saved_settings->set_value("mina/ai", "azure_endpoint", endpoint_input->get_text().strip_edges());
-	saved_settings->set_value("mina/ai", "azure_deployment", deployment_input->get_text().strip_edges());
-	api_key = api_key_input->get_text().strip_edges();
-	if (api_key.is_empty()) {
-		api_key = OS::get_singleton()->get_environment("AZURE_OPENAI_API_KEY");
+	String endpoint = endpoint_input->get_text().strip_edges();
+	String deployment = deployment_input->get_text().strip_edges();
+	if (!endpoint.is_empty()) {
+		saved_settings->set_value("mina/ai", "azure_endpoint", endpoint);
 	}
-	if (!api_key.is_empty()) {
-		String encrypted_key = _encrypt_api_key(api_key);
+	if (!deployment.is_empty()) {
+		saved_settings->set_value("mina/ai", "azure_deployment", deployment);
+	}
+	String new_api_key = api_key_input->get_text().strip_edges();
+	if (new_api_key.is_empty()) {
+		new_api_key = OS::get_singleton()->get_environment("AZURE_OPENAI_API_KEY");
+	}
+	if (!new_api_key.is_empty()) {
+		api_key = new_api_key;
+		String encrypted_key = _encrypt_api_key(new_api_key);
 #ifdef WINDOWS_ENABLED
 		if (encrypted_key.is_empty()) {
 			status_label->set_text(String::utf8("APIキーをWindowsで暗号化して保存できませんでした。環境変数 AZURE_OPENAI_API_KEY を使ってください。"));
@@ -612,10 +648,8 @@ void HorrorAIAssistantEditorPlugin::_save_settings() {
 		}
 		saved_settings->set_value("mina/ai", "azure_api_key_dpapi", encrypted_key);
 #endif
-	} else {
-		saved_settings->set_value("mina/ai", "azure_api_key_dpapi", "");
 	}
-	Error save_error = saved_settings->save(_get_saved_settings_path());
+	Error save_error = _save_saved_settings(saved_settings);
 	if (save_error != OK) {
 		status_label->set_text(vformat(String::utf8("設定を保存できませんでした (%d)。"), save_error));
 		status_label->set_visible(true);
