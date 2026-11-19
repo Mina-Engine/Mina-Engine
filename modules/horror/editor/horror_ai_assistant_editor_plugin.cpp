@@ -10,6 +10,7 @@
 
 #include "horror_ai_assistant_editor_plugin.h"
 
+#include "core/core_bind.h"
 #include "core/config/project_settings.h"
 #include "core/io/dir_access.h"
 #include "core/io/file_access.h"
@@ -29,6 +30,7 @@
 #include "scene/gui/button.h"
 #include "scene/gui/control.h"
 #include "scene/gui/dialogs.h"
+#include "scene/gui/file_dialog.h"
 #include "scene/gui/label.h"
 #include "scene/gui/line_edit.h"
 #include "scene/gui/margin_container.h"
@@ -47,6 +49,24 @@
 #endif
 
 namespace {
+
+constexpr int MAX_IMAGE_ATTACHMENTS = 4;
+constexpr int64_t MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+constexpr int64_t MAX_TOTAL_IMAGE_BYTES = 10 * 1024 * 1024;
+
+bool _is_supported_image_extension(const String &p_extension) {
+	return p_extension == "png" || p_extension == "jpg" || p_extension == "jpeg" || p_extension == "webp";
+}
+
+String _get_image_mime_type(const String &p_extension) {
+	if (p_extension == "png") {
+		return "image/png";
+	}
+	if (p_extension == "webp") {
+		return "image/webp";
+	}
+	return "image/jpeg";
+}
 
 Dictionary _schema_string(const String &p_description) {
 	Dictionary schema;
@@ -178,8 +198,25 @@ void HorrorAIAssistantEditorPlugin::_build_panel() {
 	prompt_input->set_custom_minimum_size(Size2(0, 88) * EDSCALE);
 	prompt_input->set_line_wrapping_mode(TextEdit::LINE_WRAPPING_BOUNDARY);
 	layout->add_child(prompt_input);
+	attachment_row = memnew(HBoxContainer);
+	attachment_label = memnew(Label);
+	attachment_label->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+	attachment_label->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
+	attachment_row->add_child(attachment_label);
+	clear_attachments_button = memnew(Button);
+	clear_attachments_button->set_text(String::utf8("×"));
+	clear_attachments_button->set_tooltip_text(String::utf8("画像添付を解除"));
+	clear_attachments_button->connect(SceneStringName(pressed), callable_mp(this, &HorrorAIAssistantEditorPlugin::_clear_image_attachments));
+	attachment_row->add_child(clear_attachments_button);
+	attachment_row->set_visible(false);
+	layout->add_child(attachment_row);
 
 	HBoxContainer *input_footer = memnew(HBoxContainer);
+	Button *attach_image_button = memnew(Button);
+	attach_image_button->set_text(String::utf8("＋画像"));
+	attach_image_button->set_tooltip_text(String::utf8("PNG/JPEG/WebPを添付できます。画像はAzure OpenAIに送信されます。最大4枚、1枚5 MBまで。"));
+	attach_image_button->connect(SceneStringName(pressed), callable_mp(this, &HorrorAIAssistantEditorPlugin::_open_image_dialog));
+	input_footer->add_child(attach_image_button);
 	Label *privacy_note = memnew(Label);
 	privacy_note->set_text(String::utf8("変更は自動適用・バックアップあり"));
 	privacy_note->set_h_size_flags(Control::SIZE_EXPAND_FILL);
@@ -195,6 +232,13 @@ void HorrorAIAssistantEditorPlugin::_build_panel() {
 	http_request->set_timeout(120.0);
 	dock->add_child(http_request);
 	http_request->connect("request_completed", callable_mp(this, &HorrorAIAssistantEditorPlugin::_on_request_completed));
+	image_file_dialog = memnew(FileDialog);
+	image_file_dialog->set_title(String::utf8("添付する画像を選択"));
+	image_file_dialog->set_file_mode(FileDialog::FILE_MODE_OPEN_FILES);
+	image_file_dialog->set_access(FileDialog::ACCESS_FILESYSTEM);
+	image_file_dialog->add_filter("*.png, *.jpg, *.jpeg, *.webp", String::utf8("画像ファイル"));
+	image_file_dialog->connect("files_selected", callable_mp(this, &HorrorAIAssistantEditorPlugin::_on_images_selected));
+	dock->add_child(image_file_dialog);
 
 	_build_settings_window();
 	EditorDockManager::get_singleton()->add_dock(dock);
@@ -263,6 +307,85 @@ void HorrorAIAssistantEditorPlugin::_build_settings_window() {
 	layout->add_child(buttons);
 }
 
+void HorrorAIAssistantEditorPlugin::_open_image_dialog() {
+	if (image_file_dialog) {
+		image_file_dialog->popup_centered_clamped(Size2i(840, 620));
+	}
+}
+
+void HorrorAIAssistantEditorPlugin::_on_images_selected(const PackedStringArray &p_paths) {
+	int64_t total_bytes = 0;
+	for (int i = 0; i < pending_image_paths.size(); i++) {
+		Ref<FileAccess> file = FileAccess::open(pending_image_paths[i], FileAccess::READ);
+		if (file.is_valid()) {
+			total_bytes += file->get_length();
+		}
+	}
+	String error_message;
+	for (int i = 0; i < p_paths.size(); i++) {
+		String path = p_paths[i];
+		if (pending_image_paths.has(path)) {
+			continue;
+		}
+		if (pending_image_paths.size() >= MAX_IMAGE_ATTACHMENTS) {
+			error_message = String::utf8("1回に添付できる画像は最大4枚です。");
+			break;
+		}
+		String extension = path.get_extension().to_lower();
+		if (!_is_supported_image_extension(extension)) {
+			error_message = String::utf8("PNG、JPEG、WebP画像を選択してください。");
+			continue;
+		}
+		Error error = OK;
+		Ref<FileAccess> file = FileAccess::open(path, FileAccess::READ, &error);
+		if (file.is_null()) {
+			error_message = vformat(String::utf8("画像を読み込めません: %s"), path.get_file());
+			continue;
+		}
+		int64_t image_bytes = file->get_length();
+		if (image_bytes <= 0 || image_bytes > MAX_IMAGE_BYTES || total_bytes + image_bytes > MAX_TOTAL_IMAGE_BYTES) {
+			error_message = String::utf8("画像は1枚5 MB以下、合計10 MB以下にしてください。");
+			continue;
+		}
+		pending_image_paths.push_back(path);
+		total_bytes += image_bytes;
+	}
+	_refresh_image_attachments();
+	if (!error_message.is_empty()) {
+		_set_busy(false, error_message);
+	}
+}
+
+void HorrorAIAssistantEditorPlugin::_clear_image_attachments() {
+	pending_image_paths.clear();
+	_refresh_image_attachments();
+}
+
+void HorrorAIAssistantEditorPlugin::_refresh_image_attachments() {
+	if (!attachment_label) {
+		return;
+	}
+	bool has_images = !pending_image_paths.is_empty();
+	if (attachment_row) {
+		attachment_row->set_visible(has_images);
+	}
+	if (clear_attachments_button) {
+		clear_attachments_button->set_visible(has_images);
+	}
+	if (!has_images) {
+		attachment_label->set_text(String());
+		return;
+	}
+	String label = String::utf8("添付画像: ");
+	for (int i = 0; i < pending_image_paths.size(); i++) {
+		if (i > 0) {
+			label += ", ";
+		}
+		label += String(pending_image_paths[i]).get_file();
+	}
+	attachment_label->set_text(label);
+}
+
 void HorrorAIAssistantEditorPlugin::_load_settings() {
 	saved_settings.instantiate();
 	Error load_error = saved_settings->load(_get_saved_settings_path());
@@ -297,6 +420,7 @@ void HorrorAIAssistantEditorPlugin::_start_new_session() {
 		_discard_staged_changes();
 	}
 	responses_input_items.clear();
+	_clear_image_attachments();
 	activity_entries.clear();
 	if (activity_button) {
 		activity_button->set_visible(false);
@@ -325,7 +449,7 @@ void HorrorAIAssistantEditorPlugin::_start_new_session() {
 	}
 }
 
-void HorrorAIAssistantEditorPlugin::_append_message(const String &p_role, const String &p_text) {
+void HorrorAIAssistantEditorPlugin::_append_message(const String &p_role, const String &p_text, const Array &p_image_paths) {
 	if (!message_list) {
 		return;
 	}
@@ -335,6 +459,17 @@ void HorrorAIAssistantEditorPlugin::_append_message(const String &p_role, const 
 		display_text = vformat(String::utf8("長文を送信しました（%d行・%d文字）。全文はAIに送信済みです。"), line_count, p_text.length());
 	}
 	bool is_user = p_role == "user";
+	String copy_text = p_text;
+	if (is_user && display_text.is_empty() && !p_image_paths.is_empty()) {
+		display_text = String::utf8("画像を送信しました。");
+	}
+	for (int i = 0; is_user && i < p_image_paths.size(); i++) {
+		display_text += (i == 0 ? "\n\n" : "\n") + String::utf8("画像: ") + String(p_image_paths[i]).get_file();
+		copy_text += String::utf8(i == 0 ? "\n\n" : "\n") + String::utf8("画像: ") + String(p_image_paths[i]).get_file();
+	}
+	if (is_user && copy_text.is_empty() && !p_image_paths.is_empty()) {
+		copy_text = display_text;
+	}
 	VBoxContainer *message = memnew(VBoxContainer);
 	message->set_h_size_flags(Control::SIZE_EXPAND_FILL);
 	message->add_theme_constant_override("separation", 3 * EDSCALE);
@@ -401,7 +536,7 @@ void HorrorAIAssistantEditorPlugin::_append_message(const String &p_role, const 
 	} else {
 		copy_button->set_text(String::utf8("コピー"));
 	}
-	copy_button->connect(SceneStringName(pressed), callable_mp(this, &HorrorAIAssistantEditorPlugin::_copy_message).bind(p_text));
+	copy_button->connect(SceneStringName(pressed), callable_mp(this, &HorrorAIAssistantEditorPlugin::_copy_message).bind(copy_text));
 	actions->add_child(copy_button);
 	if (is_user) {
 		Button *edit_button = memnew(Button);
@@ -413,7 +548,7 @@ void HorrorAIAssistantEditorPlugin::_append_message(const String &p_role, const 
 		} else {
 			edit_button->set_text(String::utf8("編集"));
 		}
-		edit_button->connect(SceneStringName(pressed), callable_mp(this, &HorrorAIAssistantEditorPlugin::_edit_message).bind(p_text));
+		edit_button->connect(SceneStringName(pressed), callable_mp(this, &HorrorAIAssistantEditorPlugin::_edit_message).bind(p_text, p_image_paths));
 		actions->add_child(edit_button);
 	}
 	if (transcript_scroll) {
@@ -428,11 +563,13 @@ void HorrorAIAssistantEditorPlugin::_copy_message(const String &p_text) {
 	}
 }
 
-void HorrorAIAssistantEditorPlugin::_edit_message(const String &p_text) {
+void HorrorAIAssistantEditorPlugin::_edit_message(const String &p_text, const Array &p_image_paths) {
 	if (prompt_input) {
 		prompt_input->set_text(p_text);
 		prompt_input->grab_focus();
 	}
+	pending_image_paths = p_image_paths;
+	_refresh_image_attachments();
 }
 
 String HorrorAIAssistantEditorPlugin::_get_setting(const String &p_name, const String &p_default) const {
@@ -446,13 +583,16 @@ String HorrorAIAssistantEditorPlugin::_get_setting(const String &p_name, const S
 }
 
 void HorrorAIAssistantEditorPlugin::_show_settings() {
+	if (!settings_window || !endpoint_input || !deployment_input || !api_key_input) {
+		return;
+	}
 	endpoint_input->set_text(_get_setting("mina/ai/azure_endpoint", ""));
 	deployment_input->set_text(_get_setting("mina/ai/azure_deployment", ""));
 	if (api_key.is_empty()) {
 		api_key = OS::get_singleton()->get_environment("AZURE_OPENAI_API_KEY");
 	}
 	api_key_input->set_text(api_key);
-	EditorInterface::get_singleton()->popup_dialog_centered(settings_window, Size2i(580, 420));
+	settings_window->popup_centered_clamped(Size2i(580, 420));
 }
 
 void HorrorAIAssistantEditorPlugin::_save_settings() {
@@ -491,7 +631,7 @@ void HorrorAIAssistantEditorPlugin::_send_prompt() {
 		return;
 	}
 	String prompt = prompt_input->get_text().strip_edges();
-	if (prompt.is_empty()) {
+	if (prompt.is_empty() && pending_image_paths.is_empty()) {
 		return;
 	}
 	if (api_key.is_empty()) {
@@ -504,18 +644,55 @@ void HorrorAIAssistantEditorPlugin::_send_prompt() {
 		return;
 	}
 	if (responses_input_items.is_empty() && session_title && session_title->get_text() == String::utf8("新しいセッション")) {
-		String title = prompt.replace("\n", " ").replace("\t", " ").strip_edges();
+		String title = prompt.is_empty() ? String::utf8("画像について") : prompt.replace("\n", " ").replace("\t", " ").strip_edges();
 		if (title.length() > 28) {
 			title = title.substr(0, 27) + "…";
 		}
 		session_title->set_text(title);
 	}
+	Array message_content;
+	String text_content = prompt.is_empty() ? String::utf8("添付画像の内容を確認してください。") : prompt;
+	Dictionary text_part;
+	text_part["type"] = "input_text";
+	text_part["text"] = text_content;
+	message_content.push_back(text_part);
+	int64_t total_image_bytes = 0;
+	for (int i = 0; i < pending_image_paths.size(); i++) {
+		String path = pending_image_paths[i];
+		String extension = path.get_extension().to_lower();
+		if (!_is_supported_image_extension(extension)) {
+			_set_busy(false, String::utf8("PNG、JPEG、WebP画像を選択してください。"));
+			return;
+		}
+		Error error = OK;
+		Ref<FileAccess> image_file = FileAccess::open(path, FileAccess::READ, &error);
+		if (image_file.is_null()) {
+			_set_busy(false, vformat(String::utf8("画像を読み込めません: %s"), path.get_file()));
+			return;
+		}
+		int64_t image_length = image_file->get_length();
+		if (image_length <= 0 || image_length > MAX_IMAGE_BYTES || total_image_bytes + image_length > MAX_TOTAL_IMAGE_BYTES) {
+			_set_busy(false, String::utf8("画像は1枚5 MB以下、合計10 MB以下にしてください。"));
+			return;
+		}
+		PackedByteArray image_bytes = image_file->get_buffer(image_length);
+		if (image_bytes.size() != image_length || !CoreBind::Marshalls::get_singleton()) {
+			_set_busy(false, vformat(String::utf8("画像を送信データに変換できませんでした: %s"), path.get_file()));
+			return;
+		}
+		Dictionary image_part;
+		image_part["type"] = "input_image";
+		image_part["image_url"] = "data:" + _get_image_mime_type(extension) + ";base64," + CoreBind::Marshalls::get_singleton()->raw_to_base64(image_bytes);
+		message_content.push_back(image_part);
+		total_image_bytes += image_length;
+	}
 	Dictionary response_input_message;
 	response_input_message["type"] = "message";
 	response_input_message["role"] = "user";
-	response_input_message["content"] = prompt;
+	response_input_message["content"] = message_content;
 	responses_input_items.push_back(response_input_message);
-	_append_message("user", prompt);
+	_append_message("user", prompt, pending_image_paths);
+	_clear_image_attachments();
 	prompt_input->clear();
 	tool_round = 0;
 	_set_busy(true, String::utf8("Azure OpenAIに接続しています…"));
@@ -1222,7 +1399,6 @@ void HorrorAIAssistantEditorPlugin::_apply_changes() {
 	staged_files.clear();
 	_refresh_activity_view();
 	status_label->set_visible(false);
-	_append_message("assistant", vformat(String::utf8("変更を適用しました。バックアップは `%s` に保存しました。"), backup_root));
 }
 
 void HorrorAIAssistantEditorPlugin::_notification(int p_what) {

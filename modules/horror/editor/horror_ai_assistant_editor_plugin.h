@@ -18,6 +18,8 @@
 
 class Button;
 class EditorDock;
+class FileDialog;
+class HBoxContainer;
 class HTTPRequest;
 class Label;
 class LineEdit;
@@ -35,11 +37,15 @@ class HorrorAIAssistantEditorPlugin : public EditorPlugin {
 	HTTPRequest *http_request = nullptr;
 	ScrollContainer *transcript_scroll = nullptr;
 	VBoxContainer *message_list = nullptr;
+	FileDialog *image_file_dialog = nullptr;
+	HBoxContainer *attachment_row = nullptr;
 	TextEdit *prompt_input = nullptr;
 	Label *status_label = nullptr;
 	Label *session_title = nullptr;
+	Label *attachment_label = nullptr;
 	Button *send_button = nullptr;
 	Button *activity_button = nullptr;
+	Button *clear_attachments_button = nullptr;
 	Window *settings_window = nullptr;
 	TextEdit *activity_details = nullptr;
 	LineEdit *endpoint_input = nullptr;
@@ -48,6 +54,7 @@ class HorrorAIAssistantEditorPlugin : public EditorPlugin {
 
 	Array responses_input_items;
 	Array activity_entries;
+	Array pending_image_paths;
 	String system_instructions;
 	Dictionary staged_files;
 	String api_key;
@@ -58,11 +65,15 @@ class HorrorAIAssistantEditorPlugin : public EditorPlugin {
 
 	void _build_panel();
 	void _build_settings_window();
+	void _open_image_dialog();
+	void _on_images_selected(const PackedStringArray &p_paths);
+	void _clear_image_attachments();
+	void _refresh_image_attachments();
 	void _load_settings();
 	void _start_new_session();
-	void _append_message(const String &p_role, const String &p_text);
+	void _append_message(const String &p_role, const String &p_text, const Array &p_image_paths = Array());
 	void _copy_message(const String &p_text);
-	void _edit_message(const String &p_text);
+	void _edit_message(const String &p_text, const Array &p_image_paths);
 	void _send_prompt();
 	void _request_next_turn();
 	void _on_request_completed(int p_result, int p_response_code, const PackedStringArray &p_headers, const PackedByteArray &p_body);
